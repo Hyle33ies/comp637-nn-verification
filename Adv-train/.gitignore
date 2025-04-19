@@ -77,3 +77,4 @@ slurm-*.out
 
 # Models
 *.pt
+results/

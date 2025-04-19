@@ -103,6 +103,9 @@ parser.add_argument('--beta', default=0.5, type=float,
 parser.add_argument('--warmup-epochs', type=int, default=3, metavar='N',
                     help='number of epochs for warmup')
 
+parser.add_argument('--dropout-rate', type=float, default=0.3,
+                    help='dropout rate for WideResNet (default: 0.3)')
+
 parser.add_argument('--model-dir', default='./results/gtsrb_atas',
                     help='directory of model for saving checkpoint')
 
@@ -422,7 +425,7 @@ def main():
     
     # Create a WideResNet directly
     print("Creating WideResNet-28-10 model from scratch")
-    base_model = WideResNet(depth=28, num_classes=num_classes, widen_factor=10)
+    base_model = WideResNet(depth=28, num_classes=num_classes, widen_factor=10, dropRate=args.dropout_rate)
     
     # Create the full model with normalization
     model = nn.Sequential(normalize, base_model).cuda()
@@ -472,6 +475,9 @@ def main():
     # Log warmup status
     if args.warmup_epochs > 0:
         print(f"Using {args.warmup_epochs} epochs of natural training for warmup before adversarial training")
+
+    if args.dropout_rate > 0:
+        print(f"Using dropout rate: {args.dropout_rate}")
      
     # Main training loop
     for epoch in range(1, args.epochs + 1):
@@ -500,8 +506,8 @@ def main():
         # Evaluate on clean test data
         test_nat_loss, test_nat_acc = test_natural(model, test_loader)
         
-        # Evaluate adversarial robustness every 3 epochs or at the final epoch
-        if epoch % 3 == 0 or epoch == args.epochs:
+        # Evaluate adversarial robustness every 3 epochs
+        if epoch % 3 == 0:
             print(f"Performing adversarial evaluation at epoch {epoch}...")
             epsilon_test = args.epsilon
             test_adv_loss, test_adv_acc = test_adversarial(
@@ -532,11 +538,11 @@ def main():
                    f"{epoch_time:.2f}\n")
         
         # Save checkpoint at regular intervals
-        if epoch % 10 == 0:
-            torch.save(model.module.state_dict(), os.path.join(model_dir, f'model_epoch_{epoch}.pt'))
+        # if epoch % 10 == 0:
+        #     torch.save(model.module.state_dict(), os.path.join(model_dir, f'model_epoch_{epoch}.pt'))
         
         # Keep track of best model - only update for epochs where we actually evaluated adversarial performance
-        if not math.isnan(test_adv_acc) and test_adv_acc > best_robust_acc:
+        if not math.isnan(test_adv_acc) and test_adv_acc > best_robust_acc: # best robustness
             best_robust_acc = test_adv_acc
             best_epoch = epoch
             torch.save(model.module.state_dict(), os.path.join(model_dir, 'best.pt'))
@@ -560,6 +566,7 @@ def main():
         f.write(f"\nTraining completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Best robust accuracy: {best_robust_acc:.2f}% at epoch {best_epoch}\n")
         f.write(f"Final natural accuracy: {final_nat_acc:.2f}%\n")
+        f.write(f"Dropout rate used: {args.dropout_rate}\n")
         for eps in epsilons:
             _, robust_acc = test_adversarial(model, test_loader, epsilon=eps, step_size=eps/5, steps=20)
             f.write(f"Robust accuracy (ε={eps*255:.1f}/255): {robust_acc:.2f}%\n")
