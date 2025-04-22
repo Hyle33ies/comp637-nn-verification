@@ -1,21 +1,21 @@
 # ->->->->-> Primary <-<-<-<-<-
-arch: "wrn_28_10" # Use WRN-28-10
-exp_name: "gtsrb_hydra_prune_95" # Experiment name
+arch: "wrn_28_4_prune" # Use the adapted architecture for WRN-28-4
+exp_name: "gtsrb_hydra_prune_wrn28_4_80" # Experiment name
 result_dir: "./trained_models"
-num_classes: 43 # GTSRB has 43 classes
+num_classes: 43 # GTSRB
 exp_mode: "prune" # Set experiment mode to prune
 layer_type: "subnet" # Use subnet layers for pruning
 init_type: "kaiming_normal"
 
 
 # ->->->->-> Pruning <-<-<-<-<-
-k: 0.05 # 95% pruning = keep 5%
+k: 0.2 # 80% pruning = keep 20%
 
 # ->->->->-> Train <-<-<-<-<-
 trainer: "adv" # Use adversarial trainer context from pretraining
 epochs: 20 # Number of epochs for pruning stage (as per README example)
 optimizer: "sgd"
-lr: 0.01 # Learning rate for pruning stage (may need tuning)
+lr: 0.01 # Learning rate for pruning stage
 lr_schedule: "cosine" # Or "step"
 wd: 0.0001
 momentum: 0.9
@@ -48,9 +48,9 @@ semisup_fraction: 1.0
 
 # ->->->->-> Adv <-<-<-<-<-
 # Use settings consistent with pretraining if relevant for pruning loss/eval
-epsilon: 8.0 / 255 # Match pretraining epsilon
+epsilon: 0.031372549 # Actual float value for 8.0 / 255
 num_steps: 10 # PGD steps for validation
-step_size: 2.0 / 255 # PGD step size for validation
+step_size: 0.007843137 # Actual float value for 2.0 / 255
 clip_min: 0
 clip_max: 1
 distance: "l_inf"
@@ -58,6 +58,6 @@ beta: 6.0 # From TRADES, might not be relevant if using standard Adv
 
 
 # ->->->->-> Misc <-<-<-<-<-
-gpu: "0" # Specify GPU
+gpu: "0"
 seed: 42 # Use a seed for reproducibility
 print_freq: 100 

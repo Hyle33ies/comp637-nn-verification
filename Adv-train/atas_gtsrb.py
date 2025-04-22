@@ -2,6 +2,7 @@ from __future__ import print_function
 
 import argparse
 import os
+import sys
 import json
 import numpy as np
 import pandas as pd
@@ -22,6 +23,12 @@ import tqdm
 import math
 import time
 from datetime import datetime
+from collections import OrderedDict
+
+# Add Prune directory to path to import its models/layers
+sys.path.append('..')
+import Prune.models as prune_models
+from Prune.models.layers import SubnetConv, SubnetLinear
 
 try:
     import psutil
@@ -82,6 +89,13 @@ parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
 parser.add_argument('--num-workers', default=4, type=int)
 parser.add_argument('--seed', type=int, default=1, help='random seed')
 
+parser.add_argument('--arch', type=str, default='WideResNet',
+                    help='Model architecture name (e.g., WideResNet). Only WideResNet currently supported here for scratch training.')
+parser.add_argument('--depth', type=int, default=28,
+                    help='Depth of WideResNet (e.g., 28, 10).')
+parser.add_argument('--widen-factor', type=int, default=4,
+                    help='Widen factor of WideResNet (e.g., 4, 2).')
+
 parser.add_argument('--decay-steps', default=[24, 28], type=int, nargs="+")
 
 parser.add_argument('--epsilon', default=8/255, type=float,
@@ -108,6 +122,10 @@ parser.add_argument('--dropout-rate', type=float, default=0.3,
 
 parser.add_argument('--model-dir', default='./results/gtsrb_atas',
                     help='directory of model for saving checkpoint')
+
+# Arguments for loading pruned model
+parser.add_argument('--source-net', type=str, default=None,
+                    help='Path to the pruned checkpoint file to fine-tune.')
 
 args = parser.parse_args()
 
@@ -176,7 +194,7 @@ class GTSRBTestDataset(Dataset):
             
         return image, label
 
-def train(args, model, train_loader, delta, optimizer, scheduler, gdnorms, epoch):
+def train(args, model, train_loader, delta, optimizer, scheduler, gdnorms, epoch, mask_dict=None):
     model.train()
 
     train_loss = 0
@@ -281,6 +299,21 @@ def train(args, model, train_loader, delta, optimizer, scheduler, gdnorms, epoch
         optimizer.step()
         scheduler.step()
         
+        # --- Apply pruning mask if provided --- 
+        if mask_dict is not None:
+            with torch.no_grad():
+                # model is DataParallel-wrapped, base_model is model.module[1]
+                base_model = model.module[1] 
+                for name, param in base_model.named_parameters():
+                    if name in mask_dict:
+                        mask = mask_dict[name].to(param.device) 
+                        param.data.mul_(mask.float()) # Apply mask inplace
+                    else:
+                        # This case should ideally not happen if prune_lwm saves masks for all params
+                        # print(f"Warning: Parameter {name} not found in mask_dict during fine-tuning.")
+                        pass # Assume unmasked params are kept
+        # -------------------------------------
+        
         # Update loss tracking
         train_loss += loss.item()
 
@@ -370,6 +403,9 @@ def test_adversarial(model, test_loader, epsilon, step_size=0.007, steps=20):
 
 
 def main():
+    # Track total training time
+    training_start_time = time.time()
+    
     # Load the class count from Meta.csv
     meta_df = pd.read_csv('./data/GTSRB/Meta.csv')
     num_classes = meta_df['ClassId'].max() + 1
@@ -423,13 +459,128 @@ def main():
     std = np.array([0.229, 0.224, 0.225])
     normalize = Normalize(mean, std)
     
-    # Create a WideResNet directly
-    print("Creating WideResNet-28-10 model from scratch")
-    base_model = WideResNet(depth=28, num_classes=num_classes, widen_factor=10, dropRate=args.dropout_rate)
+    # --- Dynamic Model Creation --- 
+    if args.arch == 'WideResNet':
+        print(f"Creating standard model architecture: {args.arch}-{args.depth}-{args.widen_factor}")
+        # Use arguments for depth and widen_factor
+        base_model = WideResNet(
+            depth=args.depth, 
+            num_classes=num_classes, 
+            widen_factor=args.widen_factor, 
+            dropRate=args.dropout_rate
+        )
+        print(f"Successfully created {args.arch}-{args.depth}-{args.widen_factor} instance.")
+    else:
+        # Keep the logic for loading pruned archs if needed, but error for scratch training
+        if args.source_net and args.arch.endswith('_prune'):
+             print(f"Creating pruned model architecture: {args.arch}")
+             # Assuming the function name in prune_models matches args.arch
+             # And it accepts conv_layer, linear_layer, num_classes, dropRate
+             try:
+                 base_model = prune_models.__dict__[args.arch](
+                     conv_layer=SubnetConv,
+                     linear_layer=SubnetLinear,
+                     num_classes=num_classes,
+                     dropRate=args.dropout_rate # Pass dropout rate
+                     # depth and widen_factor are implicitly defined by the arch name
+                 )
+                 print("Successfully created pruned model instance.")
+             except KeyError:
+                 print(f"Error: Architecture '{args.arch}' not found in Prune/models.")
+                 sys.exit(1)
+             except Exception as e:
+                  print(f"Error creating pruned model '{args.arch}': {e}")
+                  sys.exit(1)
+        else:
+            print(f"Error: Unsupported architecture '{args.arch}' for training from scratch.")
+            sys.exit(1)
+
+    # --- Load Checkpoint --- 
+    loaded_mask_dict = None # Initialize mask dict as None
+    if args.source_net:
+        if os.path.isfile(args.source_net):
+            print(f"=> loading source model from '{args.source_net}'")
+            checkpoint = torch.load(args.source_net, map_location='cuda')
+            
+            # --- Load State Dict --- 
+            if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                print("   Loading state_dict from checkpoint dictionary.")
+                state_dict = checkpoint['state_dict']
+            # Add check for ATAS style checkpoint if needed later
+            # elif isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint: ... 
+            else:
+                # Assume checkpoint is the state_dict itself
+                print("   Loading checkpoint directly as state_dict.")
+                state_dict = checkpoint
+
+            # Clean keys (remove 'module.' prefix if present in checkpoint)
+            new_state_dict = OrderedDict()
+            # Check if the first key starts with module. - handles both normal and DataParallel saved models
+            has_module_prefix = list(state_dict.keys())[0].startswith('module.')
+            if has_module_prefix:
+                 print("   Detected 'module.' prefix in checkpoint keys. Removing it.")
+
+            for k, v in state_dict.items():
+                name = k[7:] if has_module_prefix else k
+                
+                # Skip keys related to the normalization layer if they exist in the checkpoint
+                # (Unlikely for prune checkpoints, but good practice)
+                if name.startswith('0.'): 
+                    print(f"   Skipping normalization layer key from checkpoint: {k}")
+                    continue
+                
+                new_state_dict[name] = v
+
+            # Load into the base_model directly (before wrapping)
+            try:
+                load_result = base_model.load_state_dict(new_state_dict, strict=False)
+                print(f"=> loaded state_dict from '{args.source_net}' into base_model successfully.")
+                if load_result.missing_keys:
+                    print("   Missing keys:", load_result.missing_keys)
+                if load_result.unexpected_keys:
+                    print("   Unexpected keys:", load_result.unexpected_keys)
+            except Exception as e:
+                 print(f"Error loading state_dict into base_model: {e}")
+                 # Decide if exit is needed
+                 # sys.exit(1)
+                 
+            # --- Load Mask Dict (if present) ---
+            if isinstance(checkpoint, dict) and 'mask_dict' in checkpoint:
+                print("   Loading mask_dict from checkpoint dictionary.")
+                loaded_mask_dict = checkpoint['mask_dict']
+                # Ensure mask keys match base_model parameters (should already match from prune_lwm)
+                mask_keys = set(loaded_mask_dict.keys())
+                param_keys = set(dict(base_model.named_parameters()).keys())
+                if mask_keys != param_keys:
+                    print("Warning: Mismatch between mask keys and base_model parameter names!")
+                    print("  Keys in mask only:", mask_keys - param_keys)
+                    print("  Keys in params only:", param_keys - mask_keys)
+                    # loaded_mask_dict = None # Optionally disable masking if keys mismatch
+                else:
+                    print("   Mask keys verified against base_model parameters.")
+            else:
+                print("   No mask_dict found in checkpoint. Performing standard fine-tuning.")
+
+        else:
+            print(f"=> no checkpoint found at '{args.source_net}'. Training from scratch or using specified arch defaults.")
     
+    # --- Freeze scores if fine-tuning a pruned model --- 
+    if args.source_net and args.arch.endswith('_prune'):
+        print("Freezing popup_scores for fine-tuning...")
+        # Freeze scores in the base_model *before* wrapping it
+        frozen_count = 0
+        for module in base_model.modules():
+            if hasattr(module, 'popup_scores'):
+                if module.popup_scores is not None: # Check if scores exist
+                    module.popup_scores.requires_grad = False
+                    frozen_count += 1
+                # else: # Optional: Log if attribute exists but is None
+                #     print(f"  Note: Found popup_scores attribute but it is None in {module}")
+        print(f"  Frozen scores in {frozen_count} modules.")
+
     # Create the full model with normalization
     model = nn.Sequential(normalize, base_model).cuda()
-    print(f"Model created with {num_classes} classes")
+    print(f"Model created with {num_classes} classes and wrapped with normalization.")
     
     # Parallel training if multiple GPUs are available
     model = torch.nn.DataParallel(model)
@@ -496,7 +647,8 @@ def main():
          
         # Train for one epoch
         train_loss, train_nat_acc, train_adv_acc = train(
-            args, model, train_loader, delta, optimizer, scheduler, gdnorm, epoch
+            args, model, train_loader, delta, optimizer, scheduler, gdnorm, epoch,
+            mask_dict=loaded_mask_dict # Pass the loaded mask
         )
         
         # Log memory usage after training
@@ -557,8 +709,10 @@ def main():
     
     # Test with multiple epsilon values
     epsilons = [4/255, 8/255, 16/255]
+    robust_results = {}  # Store results to avoid redundant evaluation
     for eps in epsilons:
         _, robust_acc = test_adversarial(model, test_loader, epsilon=eps, step_size=eps/5, steps=20)
+        robust_results[eps] = robust_acc
         print(f"Robust accuracy (ε={eps*255:.1f}/255): {robust_acc:.2f}%")
     
     # Log summary
@@ -567,12 +721,25 @@ def main():
         f.write(f"Best robust accuracy: {best_robust_acc:.2f}% at epoch {best_epoch}\n")
         f.write(f"Final natural accuracy: {final_nat_acc:.2f}%\n")
         f.write(f"Dropout rate used: {args.dropout_rate}\n")
+        # Use stored results instead of running evaluation again
         for eps in epsilons:
-            _, robust_acc = test_adversarial(model, test_loader, epsilon=eps, step_size=eps/5, steps=20)
+            robust_acc = robust_results[eps]
             f.write(f"Robust accuracy (ε={eps*255:.1f}/255): {robust_acc:.2f}%\n")
     
     print(f"\nBest model saved at epoch {best_epoch} with {best_robust_acc:.2f}% robust accuracy")
     print(f"Training log saved to {log_file}")
+    
+    # Calculate and log total training time
+    total_training_time = time.time() - training_start_time
+    hours, remainder = divmod(total_training_time, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    time_str = f"{int(hours):02d}:{int(minutes):02d}:{seconds:.2f}"
+    
+    # Log total time to file
+    with open(log_file, 'a') as f:
+        f.write(f"Total training time: {time_str} ({total_training_time:.2f} seconds)\n")
+    
+    print(f"Total training time: {time_str}")
 
 if __name__ == '__main__':
     main() 

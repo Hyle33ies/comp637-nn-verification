@@ -16,7 +16,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data.dataset import Dataset
 from torchvision import datasets, transforms
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.utils.data.sampler import SubsetRandomSampler
 
 import models
 import data
@@ -39,6 +43,10 @@ from utils.model import (
     sanity_check_paramter_updates,
     snip_init,
 )
+# from data.tiny_imagenet import TinyImagenet # File does not exist
+from data.svhn import SVHN
+# from data.mnist import MNIST # File is empty
+from data.gtsrb import GTSRB
 
 
 # TODO: update wrn, resnet models. Save both subnet and dense version.
@@ -116,7 +124,7 @@ def main():
         ).to(device)
     else:
         model = models.__dict__[args.arch](
-            cl, ll, args.init_type, num_classes=args.num_classes
+            cl, ll, init_type=args.init_type, num_classes=args.num_classes
         ).to(device)
     logger.info(model)
 
@@ -127,10 +135,27 @@ def main():
     writer = SummaryWriter(os.path.join(result_sub_dir, "tensorboard"))
 
     # Dataloader
-    D = data.__dict__[args.dataset](args, normalize=args.normalize)
-    train_loader, test_loader = D.data_loaders()
+    if args.dataset == "SVHN":
+        train_loader, val_loader = SVHN(args, normalize=args.normalize).data_loaders(
+            num_workers=8
+        )
+    elif args.dataset == "GTSRB":
+        D = GTSRB(args, normalize=args.normalize)
+        train_loader, val_loader = D.data_loaders(
+            num_workers=8
+        )
+    else:
+        # Check if dataset exists in data.__dict__ before accessing
+        if args.dataset not in data.__dict__:
+             raise ValueError(f"Dataset {args.dataset} not found in data module.")
+        D = data.__dict__[args.dataset](args, normalize=args.normalize)
+        train_loader, test_loader = D.data_loaders()
+        # Assign test_loader to val_loader for consistency
+        val_loader = test_loader
 
-    logger.info(args.dataset, D, len(train_loader.dataset), len(test_loader.dataset))
+    # Use val_loader consistently (test_loader might not be defined for all branches)
+    logger.info("Dataset: %s, Train Len: %d, Val Len: %d", 
+                args.dataset, len(train_loader.dataset), len(val_loader.dataset))
 
     # Semi-sup dataloader
     if args.is_semisup:
@@ -153,11 +178,18 @@ def main():
     if args.source_net:
         if os.path.isfile(args.source_net):
             logger.info("=> loading source model from '{}'".format(args.source_net))
-            checkpoint = torch.load(args.source_net, map_location=device)
-            model.load_state_dict(checkpoint["state_dict"])
+            checkpoint = torch.load(args.source_net, map_location="cuda")
+            # Check if it's a dictionary and contains 'state_dict' key
+            if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                logger.info("Loading state_dict from checkpoint dictionary.")
+                model.load_state_dict(checkpoint['state_dict'], strict=False)
+            else:
+                # Assume checkpoint is the state_dict itself (e.g., from initial pretraining)
+                logger.info("Loading checkpoint directly as state_dict.")
+                model.load_state_dict(checkpoint, strict=False)
             logger.info("=> loaded checkpoint '{}'".format(args.source_net))
         else:
-            logger.info("=> no checkpoint found at '{}'".format(args.resume))
+            logger.info("=> no checkpoint found at '{}'".format(args.source_net))
 
     # Init scores once source net is loaded.
     # NOTE: scaled_init_scores will overwrite the scores in the pre-trained net.
@@ -188,10 +220,15 @@ def main():
     if args.resume:
         if os.path.isfile(args.resume):
             logger.info("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume, map_location=device)
+            checkpoint = torch.load(args.resume, map_location="cuda")
             args.start_epoch = checkpoint["epoch"]
             best_prec1 = checkpoint["best_prec1"]
-            model.load_state_dict(checkpoint["state_dict"])
+            # Need to check if resuming checkpoint has state_dict key or is state_dict itself
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["state_dict"], strict=False)
+            else:
+                # Assume checkpoint is the state_dict if not a dict with the key
+                 model.load_state_dict(checkpoint, strict=False)
             optimizer.load_state_dict(checkpoint["optimizer"])
             logger.info(
                 "=> loaded checkpoint '{}' (epoch {})".format(
@@ -203,7 +240,7 @@ def main():
 
     # Evaluate
     if args.evaluate or args.exp_mode in ["prune", "finetune"]:
-        p1, _ = val(model, device, test_loader, criterion, args, writer)
+        p1, _ = val(model, device, val_loader, criterion, args, writer)
         logger.info(f"Validation accuracy {args.val_method} for source-net: {p1}")
         if args.evaluate:
             return
@@ -212,10 +249,8 @@ def main():
 
     show_gradients(model)
 
-    if args.source_net:
-        last_ckpt = checkpoint["state_dict"]
-    else:
-        last_ckpt = copy.deepcopy(model.state_dict())
+    # Initialize last_ckpt *after* loading source net/resuming and *before* the loop
+    last_ckpt = copy.deepcopy(model.state_dict())
 
     # Start training
     for epoch in range(args.start_epoch, args.epochs + args.warmup_epochs):
@@ -237,13 +272,13 @@ def main():
         # evaluate on test set
         if args.val_method == "smooth":
             prec1, radii = val(
-                model, device, test_loader, criterion, args, writer, epoch
+                model, device, val_loader, criterion, args, writer, epoch
             )
             logger.info(f"Epoch {epoch}, mean provable Radii  {radii}")
         if args.val_method == "mixtrain" and epoch <= args.schedule_length:
             prec1 = 0.0
         else:
-            prec1, _ = val(model, device, test_loader, criterion, args, writer, epoch)
+            prec1, _ = val(model, device, val_loader, criterion, args, writer, epoch)
 
         # remember best prec@1 and save checkpoint
         is_best = prec1 > best_prec1
@@ -280,7 +315,7 @@ def main():
         )
 
         # Check what parameters got updated in the current epoch.
-        sw, ss = sanity_check_paramter_updates(model, last_ckpt)
+        sw, ss = sanity_check_paramter_updates(model, last_ckpt) # type: ignore
         logger.info(
             f"Sanity check (exp-mode: {args.exp_mode}): Weight update - {sw}, Scores update - {ss}"
         )

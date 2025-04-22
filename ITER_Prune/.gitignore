@@ -1,0 +1,78 @@
+trained_models/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.pkl
+*.pickle
+
+# Jupyter notebooks
+.ipynb_checkpoints
+
+# PyTorch / model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# PyTorch Lightning
+lightning_logs/
+*.log
+
+# TensorBoard
+runs/
+events.out.tfevents.*
+
+# Data caches / outputs
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.csv
+*.tsv
+data/
+datasets/
+output/
+outputs/
+checkpoints/
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# VSCode
+.vscode/
+
+# PyCharm
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+log/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Configs
+config.yaml
+*.json
+
+# Tokenizers / transformers cache
+.cache/
+.huggingface/
+
+# WandB
+wandb/
+
+# Slurm or job scheduler outputs
+slurm-*.out
