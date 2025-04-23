@@ -46,7 +46,7 @@ echo "Log file: $LOG_FILE"
 echo "======================================"
 
 # Run ATAS adversarial training on GTSRB
-python atas_gtsrb.py \
+python ATAS_GTSRB.py \
   --batch-size ${BATCH_SIZE} \
   --test-batch-size ${TEST_BATCH_SIZE} \
   --epochs ${EPOCHS} \

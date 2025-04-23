@@ -1,4 +1,3 @@
-
 import torch
 import torchvision
 from torchvision import transforms
@@ -7,7 +6,8 @@ import os
 import torch.utils.data
 import random
 
-ROOT = "/path/to/data/"
+# Use environment variable or default to './data'
+ROOT = os.environ.get('DATA_PATH', './data')
 shapes_dict = {'cifar10': [3, 40, 40], "cifar100": [3, 40, 40], "imagenet": [3, 32, 32]}
 datasets_dict = {'cifar10': datasets.CIFAR10, "cifar100": datasets.CIFAR100, "imagenet": datasets.ImageFolder}
 dir_dict = {'cifar10': "CIFAR10", 'cifar100': "CIFAR100", "imagenet": "imagenet"}
@@ -73,8 +73,3 @@ def load_data_imagenet_val(dataset, batch_size, num_workers):
     test_loader = torch.utils.data.DataLoader(dataset=test_data, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=num_workers)
 
     return test_loader
-
-
-
-
-

@@ -1,57 +1,92 @@
 #!/usr/bin/env bash
 
-BATCH_SIZE=128
-WD=5e-4
-LR=0.1
+# Create result and log directories
+mkdir -p ./results/cifar_atas_resnet18
+mkdir -p ./log
 
-DATASET=$1
+# --- Model & Training Configuration --- 
+# Basic settings
+DATASET="cifar10"                  # Dataset name (cifar10 or cifar100)
+ARCH="ResNet18"                    # Model architecture
+EPOCHS=30                          # Total training epochs
+BATCH_SIZE=128                     # Training batch size
+TEST_BATCH_SIZE=128                # Evaluation batch size
+LR=0.1                             # Initial learning rate
+WEIGHT_DECAY=5e-4                  # Weight decay for regularization
+MOMENTUM=0.9                       # SGD momentum
 
-EPOCHS=30
+# Learning rate schedule
+# Note: Learning rate will be reduced by 10x at these epochs
 DECAY_STEPS="24 28"
-EPSILON=$2
 
-C=0.01
-MAX_STEP_SIZE=14
-MIN_STEP_SIZE=4
+# Adversarial training parameters
+EPSILON=8                          # Perturbation size (8/255)
+WARMUP_EPOCHS=3                    # Natural training epochs before adversarial training
+# No dropout for standard ResNet18
 
-ARCH=PreActResNet18
-MODEL_DIR=${DATASET}_${ARCH}_eps${EPSILON}_ATAS
+# ATAS specific parameters
+C=0.01                             # Hard fraction for adaptive step size
+MAX_STEP_SIZE=14                   # Maximum perturbation step size
+MIN_STEP_SIZE=4                    # Minimum perturbation step size
+EPOCHS_RESET=10                    # Reset perturbations every N epochs
+
+# Output directories & resources
+MODEL_DIR="./results/cifar_atas_resnet18"
+mkdir -p $MODEL_DIR
+LOG_DIR="./log"
+mkdir -p $LOG_DIR
+LOG_FILE="${LOG_DIR}/cifar_atas_resnet18.log"
+NUM_WORKERS=4                      # Number of data loader workers
+
+# Display configuration
+echo "==== CIFAR Adversarial Training ====="
+echo "Dataset: $DATASET"
+echo "Model: $ARCH"
+echo "Batch size: $BATCH_SIZE"
+echo "Epochs: $EPOCHS"
+echo "Learning rate: $LR"
+echo "Epsilon: $EPSILON/255"
+echo "Results will be saved to: $MODEL_DIR"
+echo "Log file: $LOG_FILE"
+echo "======================================"
+
+# Run ATAS adversarial training
 python3 -u ATAS.py \
-  --dataset ${DATASET}\
-  --batch-size ${BATCH_SIZE}\
-  --epochs ${EPOCHS}\
-  --wd ${WD} \
-  --lr ${LR}\
-  --arch ${ARCH}\
-  --decay-steps ${DECAY_STEPS}\
-  --epsilon ${EPSILON}\
-  --max-step-size ${MAX_STEP_SIZE} \
-  --min-step-size ${MIN_STEP_SIZE} \
-  --model-dir results/${MODEL_DIR}\
-  --c ${C}\
-  > log/${MODEL_DIR}.log 2>&1
+  --dataset $DATASET \
+  --arch $ARCH \
+  --batch-size $BATCH_SIZE \
+  --test-batch-size $TEST_BATCH_SIZE \
+  --epochs $EPOCHS \
+  --lr $LR \
+  --weight-decay $WEIGHT_DECAY \
+  --momentum $MOMENTUM \
+  --decay-steps $DECAY_STEPS \
+  --epsilon $EPSILON \
+  --max-step-size $MAX_STEP_SIZE \
+  --min-step-size $MIN_STEP_SIZE \
+  --c $C \
+  --model-dir $MODEL_DIR \
+  --num-workers $NUM_WORKERS \
+  --warmup-epochs $WARMUP_EPOCHS \
+  --epochs-reset $EPOCHS_RESET \
+  | tee $LOG_FILE
 
-LOG_NAME=log/attack_${MODEL_DIR}.log
-MODEL_DIR=results/${MODEL_DIR}
-python3 -u attack.py --dataset ${DATASET} --model-dir ${MODEL_DIR} --arch ${ARCH} --epsilon ${EPSILON} > ${LOG_NAME} 2>&1
+echo "ATAS training completed! Results saved to $MODEL_DIR"
 
-ARCH=WideResNet
-MODEL_DIR=${DATASET}_${ARCH}_eps${EPSILON}_ATAS
-python3 -u ATAS.py \
-  --dataset ${DATASET}\
-  --batch-size ${BATCH_SIZE}\
-  --epochs ${EPOCHS}\
-  --wd ${WD} \
-  --lr ${LR}\
-  --arch ${ARCH}\
-  --decay-steps ${DECAY_STEPS}\
-  --epsilon ${EPSILON}\
-  --max-step-size ${MAX_STEP_SIZE} \
-  --min-step-size ${MIN_STEP_SIZE} \
-  --model-dir results/${MODEL_DIR}\
-  --c ${C}\
-  > log/${MODEL_DIR}.log 2>&1
+# Final attack evaluation
+echo "Running final attack evaluation..."
+ATTACK_LOG="${LOG_DIR}/attack_${DATASET}_${ARCH}_eps${EPSILON}.log"
+python3 -u attack.py \
+  --dataset $DATASET \
+  --model-dir $MODEL_DIR \
+  --arch $ARCH \
+  --epsilon $EPSILON > $ATTACK_LOG 2>&1
 
-LOG_NAME=log/attack_${MODEL_DIR}.log
-MODEL_DIR=results/${MODEL_DIR}
-python3 -u attack.py --dataset ${DATASET} --model-dir ${MODEL_DIR} --arch ${ARCH} --epsilon ${EPSILON} > ${LOG_NAME} 2>&1
+echo "Attack evaluation completed! Results saved to $ATTACK_LOG"
+
+# Copy the model to the verification location
+# VERIFY_MODEL_DIR="../alpha-beta-CROWN/complete_verifier/models/cifar10_resnet"
+# echo "Copying model to verification directory..."
+# mkdir -p $VERIFY_MODEL_DIR
+# cp $MODEL_DIR/best.pth $VERIFY_MODEL_DIR/
+# echo "Model copied to $VERIFY_MODEL_DIR/best.pth"

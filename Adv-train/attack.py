@@ -1,4 +1,3 @@
-
 from __future__ import print_function
 import os
 import argparse
@@ -13,11 +12,13 @@ from torchvision import datasets, transforms
 import data
 from models.wideresnet import *
 from models.preact_resnet import *
+from models.resnet import ResNet18
 from models.normalize import Normalize
 
 import autoattack
 import numpy as np
 import tqdm
+import sys
 
 
 def perturb_pgd(net, data, label, steps, eps, restarts=1):
@@ -89,7 +90,7 @@ parser = argparse.ArgumentParser(description='PyTorch CIFAR PGD Attack Evaluatio
 parser.add_argument('--batch-size', type=int, default=256, metavar='N', help='input batch size for testing (default: 200)')
 parser.add_argument('--epsilon', default=8/255, type=float, help='perturbation')
 parser.add_argument('--model-dir', default='./results/test', help='model for white-box attack evaluation')
-parser.add_argument('--arch', default='WideResNet', help='Adversarial training method: at or trades')
+parser.add_argument('--arch', default='ResNet18', help='Architecture: WideResNet, PreActResNet18, ResNet18')
 parser.add_argument('--dataset', default='cifar10')
 
 args = parser.parse_args()
@@ -108,15 +109,41 @@ def main(model_name):
     else:
         test_loader = data.load_data_imagenet_val(args.dataset, args.batch_size, kwargs['num_workers'])
     normalize = Normalize(mean, std)
+
+    num_classes = data.cls_dict[args.dataset]
     if args.dataset != 'imagenet':
-        if args.model_dir.find("PreActResNet18")!=-1:
-            args.arch = "PreActResNet18"
-        elif args.model_dir.find("WideResNet")!=-1:
-            args.arch = "WideResNet"
-        model = nn.Sequential(normalize, eval(args.arch)(num_classes=data.cls_dict[args.dataset])).cuda()
+        if args.arch == "WideResNet":
+            print("Loading WideResNet (using default depth/width)")
+            model = nn.Sequential(normalize, WideResNet(
+                depth=28,
+                num_classes=num_classes,
+                widen_factor=4,
+                dropRate=0.0
+            )).cuda()
+        elif args.arch == "PreActResNet18":
+            print("Loading PreActResNet18")
+            model = nn.Sequential(normalize, PreActResNet18(num_classes=num_classes)).cuda()
+        elif args.arch == "ResNet18":
+            print("Loading ResNet18")
+            model = nn.Sequential(normalize, ResNet18(num_classes=num_classes)).cuda()
+        else:
+             print(f"Error: Unsupported architecture '{args.arch}' for attack evaluation")
+             sys.exit(1)
     else:
-        model = nn.Sequential(normalize, eval('torchvision.models.'+args.arch+"()")).cuda()
-    model.load_state_dict(torch.load(os.path.join(args.model_dir, "{}.pt".format(model_name))))
+        print(f"Loading ImageNet model: {args.arch}")
+        if args.arch == 'ResNet18':
+             print("Using torchvision's ResNet18 for ImageNet attack evaluation")
+             model = nn.Sequential(normalize, torchvision.models.resnet18(num_classes=1000)).cuda()
+        else:
+             try:
+                 model = nn.Sequential(normalize, eval('torchvision.models.'+args.arch+"(num_classes=1000)")).cuda()
+             except Exception as e:
+                 print(f"Could not load torchvision model {args.arch}: {e}")
+                 sys.exit(1)
+
+    model_path = os.path.join(args.model_dir, "{}.pt".format(model_name))
+    print(f"Loading model weights from: {model_path}")
+    model.load_state_dict(torch.load(model_path))
     model = nn.DataParallel(model)
     model.eval()
 
@@ -161,4 +188,3 @@ def main(model_name):
 
 if __name__ == '__main__':
     main("last")
-
