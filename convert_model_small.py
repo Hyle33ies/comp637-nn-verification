@@ -6,12 +6,11 @@ import shutil
 from collections import OrderedDict
 
 # Make sure we have the directory for the verification model
-target_dir = "./alpha-beta-CROWN/complete_verifier/models/cifar10_resnet"
-# target_dir = "./ITER_Prune/results/cifar10_iter_lwm_resnet18"
+target_dir = "./alpha-beta-CROWN/complete_verifier/models/cifar10_resnet4b"
 os.makedirs(target_dir, exist_ok=True)
 
 # Source and destination paths
-source_model_path = "./Adv-train/results/cifar_atas_resnet18/best.pth"
+source_model_path = "./Adv-train/results/cifar_atas_resnet4b/best.pth"
 target_model_path = os.path.join(target_dir, "best.pth")
 
 print(f"Loading source model from {source_model_path}")
@@ -28,16 +27,16 @@ print("\nFirst 10 keys in source model:")
 for i, key in enumerate(list(source_state_dict.keys())[:10]):
     print(f"  {key} - Shape: {source_state_dict[key].shape}")
 
-# Create new state dict for ResNet18
+# Create new state dict for ResNet4b
 print("\nAttempting to convert to verification model format...")
 
-# First, let's check if there are any layer1, layer2, etc. keys in the source model
+# Check if there are any layer1, layer2, etc. keys in the source model
 has_layer_keys = any(key.startswith(('layer1', 'layer2', 'layer3', 'layer4')) for key in source_state_dict.keys())
 if has_layer_keys:
     print("Source model already has layer-style keys. No remapping needed, just copying...")
     new_state_dict = source_state_dict
 else:
-    # New mapping based on the actual key structure (assuming from check_model_compatibility.py output)
+    # New mapping based on the actual key structure
     new_state_dict = OrderedDict()
     
     # Define mapping for simple 1.x keys to standard ResNet keys
@@ -63,22 +62,13 @@ else:
         }
         
         # Map layer keys - look for patterns like 1.layer1, 1.layer2, etc.
-        for i in range(1, 5):  # ResNet usually has 4 layer groups
+        for i in range(1, 3):  # ResNet4b only has 2 layer groups
             if any(f"1.layer{i}." in key for key in all_keys):
                 print(f"Found 1.layer{i} pattern")
                 for key in all_keys:
                     if key.startswith(f"1.layer{i}."):
                         # Replace '1.layerX.' with 'layerX.'
                         new_key = key.replace(f"1.layer{i}.", f"layer{i}.")
-                        standard_mapping[key] = new_key
-            # Also check for alternate patterns like 1.blockX
-            elif any(f"1.block{i}." in key for key in all_keys):
-                print(f"Found 1.block{i} pattern")
-                for key in all_keys:
-                    if key.startswith(f"1.block{i}."):
-                        # Need to map block structure to layer structure
-                        # This might need customization based on exact structure
-                        new_key = key.replace(f"1.block{i}.", f"layer{i}.")
                         standard_mapping[key] = new_key
         
         # Map FC/Linear layer
@@ -88,6 +78,11 @@ else:
         elif "1.linear.weight" in all_keys:
             standard_mapping["1.linear.weight"] = "linear.weight"
             standard_mapping["1.linear.bias"] = "linear.bias"
+        elif "1.linear1.weight" in all_keys:  # For the dense layer in resnet4b
+            standard_mapping["1.linear1.weight"] = "linear1.weight"
+            standard_mapping["1.linear1.bias"] = "linear1.bias"
+            standard_mapping["1.linear2.weight"] = "linear2.weight"
+            standard_mapping["1.linear2.bias"] = "linear2.bias"
         
         # Handle any keys that haven't been mapped
         for key in all_keys:
@@ -95,11 +90,7 @@ else:
                 print(f"Warning: No mapping defined for key: {key}")
                 # Create a default mapping by removing the '1.' prefix
                 if key.startswith('1.'):
-                    if 'fc.' in key:
-                        # Convert fc to linear for compatibility
-                        new_key = key[2:].replace('fc.', 'linear.')
-                    else:
-                        new_key = key[2:]  # Remove '1.' prefix
+                    new_key = key[2:]  # Remove '1.' prefix
                     standard_mapping[key] = new_key
                     print(f"  Auto-mapping: {key} -> {new_key}")
     

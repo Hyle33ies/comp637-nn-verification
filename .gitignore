@@ -1,7 +1,4 @@
-*.pt
-*.npz
-*.npy
 data/
-checkpoints/
 .ipynb_checkpoints/
 __pycache__/
+check_model_compatibility.py

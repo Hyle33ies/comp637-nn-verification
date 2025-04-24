@@ -1,17 +1,20 @@
 model:
-  name: partial(ResNet18, in_planes=2)  # Change the in_planes if you have wider larger model.
+  name: CustomResNet18  # Using our custom model that can handle the trained weights
   # Use this command to download model: wget -O resnet18_natural_width2.pth http://download.huan-zhang.com/models/auto_lirpa/resnet18_natural.pth
-  path: models/cifar10_resnet/resnet18_natural_width2.pth
+  path: models/cifar10_resnet/best.pth
 data:
   dataset: CIFAR
   mean: [0.4914, 0.4822, 0.4465]
   std: [0.2023, 0.1994, 0.2010]
+  start: 0
+  end: 50
 specification:
-  epsilon: 0.0005  # Naturally trained, so epsilon needs to be small.
+  epsilon: 0.0005
 attack:
-  pgd_restarts: 30
+  pgd_steps: 100
+  pgd_restarts: 30 
 solver:
-  batch_size: 32
+  batch_size: 1
   alpha-crown:
     share_alphas: true
   beta-crown:

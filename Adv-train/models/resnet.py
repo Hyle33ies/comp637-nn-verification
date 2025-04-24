@@ -52,6 +52,29 @@ class BasicBlock(nn.Module):
                     nn.Conv2d(in_planes, self.expansion*planes,
                               kernel_size=1, stride=stride, bias=(not self.bn)),
                 )
+                
+        # Initialize all layers in the block with proper initialization
+        self._initialize_block()
+        
+    def _initialize_block(self):
+        # Kaiming initialization for conv layers
+        nn.init.kaiming_normal_(self.conv1.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.kaiming_normal_(self.conv2.weight, mode='fan_out', nonlinearity='relu')
+        
+        # Initialize batchnorm if used
+        if self.bn:
+            nn.init.constant_(self.bn1.weight, 1)
+            nn.init.constant_(self.bn1.bias, 0)
+            nn.init.constant_(self.bn2.weight, 1)
+            nn.init.constant_(self.bn2.bias, 0)
+            
+        # Initialize shortcut convolution if it exists
+        if len(self.shortcut) > 0:
+            if isinstance(self.shortcut[0], nn.Conv2d):
+                nn.init.kaiming_normal_(self.shortcut[0].weight, mode='fan_out', nonlinearity='relu')
+            if self.bn and len(self.shortcut) > 1 and isinstance(self.shortcut[1], nn.BatchNorm2d):
+                nn.init.constant_(self.shortcut[1].weight, 1)
+                nn.init.constant_(self.shortcut[1].bias, 0)
 
     def forward(self, x):
         if self.bn:
@@ -80,6 +103,9 @@ class ResNet(nn.Module):
         self.layer3 = self._make_layer(block, in_planes * 4, num_blocks[2], stride=2)
         self.layer4 = self._make_layer(block, in_planes * 8, num_blocks[3], stride=2)
         self.linear = nn.Linear(in_planes * 8 * block.expansion, num_classes)
+        
+        # Initialize parameters with Kaiming initialization
+        self._initialize_weights()
 
     def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1]*(num_blocks-1)
@@ -88,6 +114,22 @@ class ResNet(nn.Module):
             layers.append(block(self.in_planes, planes, stride))
             self.in_planes = planes * block.expansion
         return nn.Sequential(*layers)
+        
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                # Kaiming initialization for Conv2d layers
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                # Default initialization for BatchNorm
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                # Xavier initialization for the final linear layer
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
@@ -101,5 +143,5 @@ class ResNet(nn.Module):
         return out
 
 
-def ResNet18(in_planes=2):
+def ResNet18(in_planes=64):
     return ResNet(BasicBlock, [2, 2, 2, 2], in_planes=in_planes)

@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
 
 # Create result and log directories
-mkdir -p ./results/cifar_atas_resnet18
+mkdir -p ./results/cifar_atas_resnet4b
 mkdir -p ./log
 
 # --- Model & Training Configuration --- 
 # Basic settings
-DATASET="cifar10"                  # Dataset name (cifar10 or cifar100)
-ARCH="ResNet18"                    # Model architecture
-EPOCHS=50                          # Total training epochs
-BATCH_SIZE=128                     # Training batch size (Increased to standard 128)
+DATASET="cifar10"                  # Dataset name (cifar10 only)
+ARCH="resnet4b"                    # Model architecture (smaller ResNet variant)
+EPOCHS=100                          # Total training epochs (reduced for smaller model)
+BATCH_SIZE=64                     # Training batch size
 TEST_BATCH_SIZE=128                # Evaluation batch size
-LR=0.1                             # Initial learning rate (Adjusted for BS=128)
+LR=0.1                            # Initial learning rate (reduced for smaller model)
 WEIGHT_DECAY=5e-4                  # Weight decay for regularization
 MOMENTUM=0.9                       # SGD momentum
 
 # Learning rate schedule
 # Note: Learning rate will be reduced by 10x at these epochs
-DECAY_STEPS="24 40"                # Adjusted decay points here
+DECAY_STEPS="16 40"                # Adjusted decay points for the smaller model
 
 # Adversarial training parameters
-EPSILON=8                          # Perturbation size (8/255)
-WARMUP_EPOCHS=0                   # Natural training epochs before adversarial training
+EPSILON=4                          # Perturbation size (8/255)
+WARMUP_EPOCHS=20                    # Natural training epochs before adversarial training
 
 # ATAS specific parameters
 C=0.01                             # Hard fraction for adaptive step size
@@ -30,15 +30,15 @@ MIN_STEP_SIZE=4                    # Minimum perturbation step size
 EPOCHS_RESET=5                     # Reset perturbations
 
 # Output directories & resources
-MODEL_DIR="./results/cifar_atas_resnet18"
+MODEL_DIR="./results/cifar_atas_resnet4b"
 mkdir -p $MODEL_DIR
 LOG_DIR="./log"
 mkdir -p $LOG_DIR
-LOG_FILE="${LOG_DIR}/cifar_atas_resnet18.log"
-NUM_WORKERS=6
+LOG_FILE="${LOG_DIR}/cifar_atas_resnet4b.log"
+NUM_WORKERS=4                      # Reduced for smaller model
 
 # Display configuration
-echo "==== CIFAR Adversarial Training ====="
+echo "==== CIFAR Adversarial Training (Small Model) ====="
 echo "Dataset: $DATASET"
 echo "Model: $ARCH"
 echo "Batch size: $BATCH_SIZE"
@@ -47,7 +47,7 @@ echo "Learning rate: $LR"
 echo "Epsilon: $EPSILON/255"
 echo "Results will be saved to: $MODEL_DIR"
 echo "Log file: $LOG_FILE"
-echo "======================================"
+echo "=================================================="
 
 # Run ATAS adversarial training
 python3 -u ATAS.py \
@@ -84,8 +84,8 @@ python3 -u attack.py \
 echo "Attack evaluation completed! Results saved to $ATTACK_LOG"
 
 # Copy the model to the verification location
-# VERIFY_MODEL_DIR="../alpha-beta-CROWN/complete_verifier/models/cifar10_resnet"
-# echo "Copying model to verification directory..."
-# mkdir -p $VERIFY_MODEL_DIR
-# cp $MODEL_DIR/best.pth $VERIFY_MODEL_DIR/
-# echo "Model copied to $VERIFY_MODEL_DIR/best.pth"
+VERIFY_MODEL_DIR="../alpha-beta-CROWN/complete_verifier/models/cifar10_resnet4b"
+echo "Copying model to verification directory..."
+mkdir -p $VERIFY_MODEL_DIR
+cp $MODEL_DIR/best.pth $VERIFY_MODEL_DIR/
+echo "Model copied to $VERIFY_MODEL_DIR/best.pth" 
