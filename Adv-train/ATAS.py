@@ -101,23 +101,6 @@ parser.add_argument('--warmup-epochs', type=int, default=5, metavar='N',
 parser.add_argument('--model-dir', default='./results',
                     help='directory of model for saving checkpoint')
 
-args = parser.parse_args()
-
-# Set random seed
-torch.manual_seed(args.seed)
-np.random.seed(args.seed)
-
-epochs_reset = args.epochs_reset
-
-args.epsilon = args.epsilon/255
-args.max_step_size = args.max_step_size/255
-args.min_step_size = args.min_step_size/255
-args.step_size = args.step_size * args.epsilon
-
-model_dir = args.model_dir
-if not os.path.exists(model_dir):
-    os.makedirs(model_dir)
-
 def train(args, model, train_loader, delta, optimizer, scheduler, gdnorms, epoch):
     model.train()
 
@@ -342,6 +325,26 @@ def test_adversarial(model, test_loader, epsilon, step_size, steps):
 
 
 def main():
+    args = parser.parse_args()
+    
+    # Set random seed
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    
+    global epochs_reset
+    epochs_reset = args.epochs_reset
+    
+    # Adjust argument values (ensure args is updated if needed elsewhere)
+    args.epsilon = args.epsilon/255
+    args.max_step_size = args.max_step_size/255
+    args.min_step_size = args.min_step_size/255
+    args.step_size = args.step_size * args.epsilon
+    
+    # Create model directory
+    model_dir = args.model_dir
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
+    
     # Track total training time
     training_start_time = time.time()
     

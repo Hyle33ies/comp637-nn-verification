@@ -8,8 +8,8 @@ mkdir -p ./log
 # Basic settings
 DATASET="cifar10"                  # Dataset name (cifar10 or cifar100)
 ARCH="ResNet18"                    # Model architecture
-EPOCHS=50                          # Total training epochs
-BATCH_SIZE=128                     # Training batch size (Increased to standard 128)
+EPOCHS=30                          # Total training epochs
+BATCH_SIZE=64                     # Training batch size (Increased to standard 128)
 TEST_BATCH_SIZE=128                # Evaluation batch size
 LR=0.1                             # Initial learning rate (Adjusted for BS=128)
 WEIGHT_DECAY=5e-4                  # Weight decay for regularization
@@ -17,17 +17,17 @@ MOMENTUM=0.9                       # SGD momentum
 
 # Learning rate schedule
 # Note: Learning rate will be reduced by 10x at these epochs
-DECAY_STEPS="24 40"                # Adjusted decay points here
+DECAY_STEPS="15 25"                # Adjusted decay points here
 
 # Adversarial training parameters
 EPSILON=8                          # Perturbation size (8/255)
-WARMUP_EPOCHS=0                   # Natural training epochs before adversarial training
+WARMUP_EPOCHS=2                   # Natural training epochs before adversarial training
 
 # ATAS specific parameters
 C=0.01                             # Hard fraction for adaptive step size
 MAX_STEP_SIZE=12                   # Maximum perturbation step size
 MIN_STEP_SIZE=4                    # Minimum perturbation step size
-EPOCHS_RESET=5                     # Reset perturbations
+EPOCHS_RESET=4                     # Reset perturbations
 
 # Output directories & resources
 MODEL_DIR="./results/cifar_atas_resnet18"
@@ -35,7 +35,7 @@ mkdir -p $MODEL_DIR
 LOG_DIR="./log"
 mkdir -p $LOG_DIR
 LOG_FILE="${LOG_DIR}/cifar_atas_resnet18.log"
-NUM_WORKERS=6
+NUM_WORKERS=4
 
 # Display configuration
 echo "==== CIFAR Adversarial Training ====="

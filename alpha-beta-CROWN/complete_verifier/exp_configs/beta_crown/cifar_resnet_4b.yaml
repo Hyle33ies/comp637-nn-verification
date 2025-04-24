@@ -10,7 +10,7 @@ data:
   end: 1000  # Last example to verify in dataset. We verify 100 examples in this test.
 specification:
   norm: .inf  # Linf norm (can also be 2 or 1).
-  epsilon: 0.00392156862745098  # epsilon=2./255.
+  epsilon: 0.00392156862745098  # epsilon=1/255.
 attack:  # Currently attack is only implemented for Linf norm.
   pgd_steps: 100  # Increase for a stronger attack. A PGD attack will be used before verification to filter on non-robust data examples.
   pgd_restarts: 50  # Increase for a stronger attack.

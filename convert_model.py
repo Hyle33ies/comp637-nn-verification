@@ -11,7 +11,9 @@ target_dir = "./alpha-beta-CROWN/complete_verifier/models/cifar10_resnet"
 os.makedirs(target_dir, exist_ok=True)
 
 # Source and destination paths
-source_model_path = "./Adv-train/results/cifar_atas_resnet18/best.pth"
+# source_model_path = "./Adv-train/results/cifar_atas_resnet18/best.pth"
+# target_model_path = os.path.join(target_dir, "best.pth")
+source_model_path = "./Adv-train/results/cifar_atas_resnet18_pruned/compact_pruned_sparsity_98.0.pth"
 target_model_path = os.path.join(target_dir, "best.pth")
 
 print(f"Loading source model from {source_model_path}")
@@ -39,7 +41,7 @@ if has_layer_keys:
 else:
     # New mapping based on the actual key structure (assuming from check_model_compatibility.py output)
     new_state_dict = OrderedDict()
-    
+
     # Define mapping for simple 1.x keys to standard ResNet keys
     standard_mapping = {}
     
@@ -138,5 +140,5 @@ else:
 print("\nImportant next steps:")
 print("1. If verification still fails, you'll need to check what model was ACTUALLY trained")
 print("2. The model architecture in your YAML needs to match what was trained")
-print("3. You may need to add a custom model definition in model_defs.py to match your trained model")
+print("3. You may need to add a custom model definition in model_defs.py to match your trained model") 
 print("4. Alternatively, modify your training code to save with the expected key format") 
