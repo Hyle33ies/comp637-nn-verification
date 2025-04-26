@@ -82,7 +82,12 @@ class CResNet7(nn.Module):
             self.avg2d = nn.AvgPool2d(4)
             self.linear = nn.Linear(in_planes * 2 * block.expansion, num_classes)
         elif self.last_layer == "dense":
-            self.linear1 = nn.Linear(in_planes * 2 * block.expansion * 16, 100)
+            # Calculate the linear layer size based on the final feature map size (4x4) and channels
+            # For in_planes=16 -> 64 channels in final layer -> 64*4*4 = 1024
+            # For in_planes=32 -> 128 channels in final layer -> 128*4*4 = 2048
+            # For in_planes=64 -> 256 channels in final layer -> 256*4*4 = 4096
+            final_channels = in_planes * 2  # After layer2, we have in_planes*2 channels
+            self.linear1 = nn.Linear(final_channels * 4 * 4, 100)  # 4x4 is the spatial size
             self.linear2 = nn.Linear(100, num_classes)
         else:
             exit("last_layer type not supported!")
@@ -123,3 +128,9 @@ class CResNet7(nn.Module):
 
 def resnet4b():
     return CResNet7(BasicBlock, num_blocks=2, in_planes=16, bn=False, last_layer="dense")
+
+def resnet4b_wide():
+    return CResNet7(BasicBlock, num_blocks=2, in_planes=32, bn=False, last_layer="dense")
+
+def resnet4b_ultrawide():
+    return CResNet7(BasicBlock, num_blocks=2, in_planes=64, bn=False, last_layer="dense")

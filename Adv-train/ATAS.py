@@ -18,7 +18,7 @@ import data
 from data_aug import *
 from models.wideresnet import WideResNet
 from models.resnet import ResNet18
-from models.resnet4b import resnet4b
+from models.resnet4b import resnet4b, resnet4b_wide, resnet4b_ultrawide
 from models.normalize import Normalize
 
 import torchvision
@@ -75,7 +75,7 @@ parser.add_argument('--dataset', default='cifar10')
 parser.add_argument('--num-workers', default=4, type=int)
 parser.add_argument('--seed', type=int, default=1, help='random seed')
 
-parser.add_argument('--arch', default='WideResNet', choices=['WideResNet', 'ResNet18', 'resnet4b'],
+parser.add_argument('--arch', default='WideResNet', choices=['WideResNet', 'ResNet18', 'resnet4b', 'resnet4b_wide', 'resnet4b_ultrawide'],
                     help='Model architecture name')
 parser.add_argument('--dropout-rate', type=float, default=0.3,
                     help='Dropout rate for WideResNet')
@@ -376,6 +376,12 @@ def main():
         elif args.arch == 'resnet4b':
             print(f"Creating model: {args.arch}")
             model = nn.Sequential(normalize, resnet4b()).cuda()
+        elif args.arch == 'resnet4b_wide':
+            print(f"Creating model: {args.arch}")
+            model = nn.Sequential(normalize, resnet4b_wide()).cuda()
+        elif args.arch == 'resnet4b_ultrawide':
+            print(f"Creating model: {args.arch}")
+            model = nn.Sequential(normalize, resnet4b_ultrawide()).cuda()
         else:
             print(f"Creating model: {args.arch}")
             model = nn.Sequential(normalize, eval(args.arch)(num_classes=cls_dict[args.dataset])).cuda()
