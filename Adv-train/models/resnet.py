@@ -154,3 +154,6 @@ def ResNet18_16():
 
 def ResNet18_8():
     return ResNet(BasicBlock, [2, 2, 2, 2], in_planes=8)
+
+def ResNet18_4():
+    return ResNet(BasicBlock, [2, 2, 2, 2], in_planes=4)

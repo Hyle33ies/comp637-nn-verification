@@ -123,7 +123,7 @@ class ResNet(nn.Module):
         return out
 
 
-def ResNet18(in_planes=64):
+def ResNet18(in_planes=4):
     return ResNet(BasicBlock, [2, 2, 2, 2], in_planes=in_planes)
 
 class CResNet5(nn.Module):

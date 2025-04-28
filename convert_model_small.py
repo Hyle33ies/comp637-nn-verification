@@ -10,7 +10,7 @@ target_dir = "./alpha-beta-CROWN/complete_verifier/models/cifar10_resnet4b"
 os.makedirs(target_dir, exist_ok=True)
 
 # Source and destination paths
-source_model_path = "./Adv-train/results/cifar_atas_resnet4b_ultrawide_pruned_3/final_pruned.pth"
+source_model_path = "./Adv-train/results/cifar_atas_resnet4b_diffusion/best.pth"
 target_model_path = os.path.join(target_dir, "best.pth")
 
 print(f"Loading source model from {source_model_path}")

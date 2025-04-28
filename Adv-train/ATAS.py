@@ -12,6 +12,8 @@ import torch.optim as optim
 import torch
 import torch.nn.functional as F
 import torch.utils.data
+from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
+from torch.utils.data._utils.collate import default_collate
 
 import adv_attack
 import data
@@ -100,6 +102,24 @@ parser.add_argument('--warmup-epochs', type=int, default=5, metavar='N',
 
 parser.add_argument('--model-dir', default='./results',
                     help='directory of model for saving checkpoint')
+
+# Add new arguments for synthetic data
+parser.add_argument('--use-synthetic-data', action='store_true',
+                    help='Use synthetic data from diffusion model')
+parser.add_argument('--synthetic-data-path', default='../1m.npz',
+                    help='Path to synthetic data file (.npz)')
+parser.add_argument('--real-samples', type=int, default=15000,
+                    help='Number of real samples to use per epoch')
+parser.add_argument('--synthetic-samples', type=int, default=35000,
+                    help='Number of synthetic samples to use per epoch')
+parser.add_argument('--progressive-mixing', action='store_true',
+                    help='Progressively increase synthetic data ratio')
+parser.add_argument('--consistent-sampling', action='store_true',
+                    help='Use same subset of synthetic data across epochs')
+parser.add_argument('--filter-synthetic', action='store_true',
+                    help='Filter low-quality synthetic samples based on model confidence')
+parser.add_argument('--sync-resample', action='store_true',
+                    help='Synchronize resampling with perturbation reset (every epochs_reset)')
 
 def train(args, model, train_loader, delta, optimizer, scheduler, gdnorms, epoch):
     model.train()
@@ -324,6 +344,41 @@ def test_adversarial(model, test_loader, epsilon, step_size, steps):
     return adv_loss/len(test_loader), 100.*correct/total
 
 
+# Wrapper to add consistent indexing to datasets for ConcatDataset
+class IndexWrapper(Dataset):
+    def __init__(self, dataset, offset=0):
+        self.dataset = dataset
+        self.offset = offset  # Offset for global indexing
+    
+    def __getitem__(self, idx):
+        # Get data from the wrapped dataset
+        data, target = self.dataset[idx] # Assumes wrapped dataset returns (data, target)
+        # Ensure target is always a tensor
+        if not isinstance(target, torch.Tensor):
+            target = torch.tensor(target, dtype=torch.long)
+        return data, target, idx + self.offset
+    
+    def __len__(self):
+        return len(self.dataset)
+
+# Custom collate function to handle the index
+def indexed_collate_fn(batch):
+    """Collate function that handles (data, target, index) tuples."""
+    # Separate the components of the batch
+    data = [item[0] for item in batch]
+    targets = [item[1] for item in batch]
+    indices = [item[2] for item in batch]
+    
+    # Use default_collate for data and targets
+    collated_data = default_collate(data)
+    collated_targets = default_collate(targets)
+    
+    # Convert indices to a tensor
+    collated_indices = torch.tensor(indices, dtype=torch.long)
+    
+    return collated_data, collated_targets, collated_indices
+
+
 def main():
     args = parser.parse_args()
     
@@ -398,8 +453,231 @@ def main():
     # Initialize optimizer
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
+    # IndexedDataset wrapper to keep track of indices
+    class IndexedDataset(Dataset):
+        def __init__(self, dataset):
+            self.dataset = dataset
+        
+        def __getitem__(self, index):
+            data, target = self.dataset[index]
+            return data, target, index
+        
+        def __len__(self):
+            return len(self.dataset)
+
+    # Class for synthetic dataset from diffusion model
+    class SyntheticDataset(Dataset):
+        def __init__(self, images, labels):
+            self.images = images
+            self.labels = labels
+            # Store initial confidence scores (will be updated when filter_samples is called)
+            self.confidence_scores = torch.ones(len(images))
+        
+        def __getitem__(self, index):
+            return self.images[index], self.labels[index]
+        
+        def __len__(self):
+            return len(self.images)
+        
+        def filter_samples(self, model, batch_size=100, k=0.7):
+            """Filter synthetic samples based on model confidence
+            Args:
+                model: Trained model to evaluate sample quality
+                batch_size: Batch size for evaluation
+                k: Keep ratio (0-1), higher means keep more samples
+            """
+            model.eval()
+            device = next(model.parameters()).device
+            dataloader = DataLoader(self, batch_size=batch_size, shuffle=False)
+            confidence_scores = []
+            
+            print(f"Evaluating synthetic sample quality with model...")
+            with torch.no_grad():
+                for images, labels in tqdm.tqdm(dataloader):
+                    images, labels = images.to(device), labels.to(device)
+                    outputs = model(images)
+                    probs = F.softmax(outputs, dim=1)
+                    # Get confidence score for correct class
+                    batch_confidence = probs[torch.arange(len(labels)), labels].cpu()
+                    confidence_scores.append(batch_confidence)
+            
+            # Combine all batches
+            self.confidence_scores = torch.cat(confidence_scores)
+            print(f"Synthetic data confidence stats: Mean={self.confidence_scores.mean():.4f}, Min={self.confidence_scores.min():.4f}, Max={self.confidence_scores.max():.4f}")
+            
+            return self.confidence_scores
+
+    # Memory-efficient synthetic dataset with memory mapping
+    class MemoryMappedSyntheticDataset(Dataset):
+        def __init__(self, npz_path):
+            """
+            Memory-efficient dataset for synthetic samples using memory mapping
+            
+            Args:
+                npz_path: Path to .npz file containing synthetic samples
+            """
+            print(f"Initializing memory-mapped synthetic dataset from {npz_path}")
+            # Open the NPZ file in memory-mapped mode to avoid loading all data at once
+            self.data = np.load(npz_path, mmap_mode='r')
+            self.image_data = self.data['image']  # Memory-mapped array reference, not loaded yet
+            self.label_data = self.data['label']  # Labels are usually small, so it's ok to load them
+            
+            # Preload a small sample to check the data format
+            sample_idx = np.random.randint(0, len(self.image_data), 5)
+            sample_images = self.image_data[sample_idx]
+            
+            print(f"Dataset contains {len(self.image_data)} synthetic samples")
+            print(f"Image shape: {sample_images.shape[1:]}, dtype: {sample_images.dtype}")
+            
+            # Create initial confidence scores
+            self.confidence_scores = torch.ones(len(self.image_data))
+            
+        def __getitem__(self, index):
+            # Load single image from memory-mapped array
+            image = self.image_data[index]
+            label = self.label_data[index]
+            
+            # Convert to PyTorch tensor and normalize
+            image_tensor = torch.from_numpy(np.copy(image)).permute(2, 0, 1).float() / 255.0
+            label_tensor = torch.tensor(label, dtype=torch.long)
+            
+            return image_tensor, label_tensor
+        
+        def __len__(self):
+            return len(self.image_data)
+        
+        def filter_samples(self, model, batch_size=100, k=0.7):
+            """
+            Filter synthetic samples based on model confidence
+            Efficiently process in batches to avoid memory issues
+            """
+            model.eval()
+            device = next(model.parameters()).device
+            num_samples = len(self)
+            
+            # Process in batches to avoid memory issues
+            confidence_scores = []
+            num_batches = (num_samples + batch_size - 1) // batch_size
+            
+            print(f"Evaluating synthetic sample quality with model ({num_batches} batches)...")
+            with torch.no_grad():
+                for batch_idx in tqdm.tqdm(range(num_batches)):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min((batch_idx + 1) * batch_size, num_samples)
+                    
+                    # Process a single batch
+                    batch_images = []
+                    batch_labels = []
+                    for idx in range(start_idx, end_idx):
+                        img, lbl = self[idx]
+                        batch_images.append(img)
+                        batch_labels.append(lbl)
+                    
+                    # Convert to tensors
+                    batch_images = torch.stack(batch_images).to(device)
+                    batch_labels = torch.stack(batch_labels).to(device)
+                    
+                    # Evaluate confidence
+                    outputs = model(batch_images)
+                    probs = F.softmax(outputs, dim=1)
+                    batch_confidence = probs[torch.arange(len(batch_labels)), batch_labels].cpu()
+                    confidence_scores.append(batch_confidence)
+                    
+                    # Free memory
+                    del batch_images, batch_labels, outputs, probs
+                    torch.cuda.empty_cache()
+            
+            # Combine all batches
+            self.confidence_scores = torch.cat(confidence_scores)
+            print(f"Synthetic data confidence stats: Mean={self.confidence_scores.mean():.4f}, Min={self.confidence_scores.min():.4f}, Max={self.confidence_scores.max():.4f}")
+            
+            return self.confidence_scores
+
+    # Function to create combined dataloader with real and synthetic samples
+    def create_dynamic_loader(real_dataset, synthetic_dataset, real_per_epoch, syn_per_epoch, batch_size, num_workers, 
+                             consistent=False, epoch=0, progression_ratio=0.0, filter_synthetic=False, confidence_scores=None,
+                             force_resample=False):
+        """
+        Create a dataloader that combines real and synthetic data
+        
+        Args:
+            real_dataset: CIFAR-10 dataset
+            synthetic_dataset: Synthetic dataset
+            real_per_epoch: Number of real samples per epoch
+            syn_per_epoch: Target number of synthetic samples per epoch
+            batch_size: Batch size
+            num_workers: Number of workers
+            consistent: Whether to use consistent sampling across epochs
+            epoch: Current epoch (for progressive mixing)
+            progression_ratio: Ratio of synthetic samples to use (0.0-1.0)
+            filter_synthetic: Whether to filter synthetic samples by quality
+            confidence_scores: Confidence scores for synthetic samples (if filtering)
+            force_resample: Force resampling even with consistent sampling enabled
+        """
+        # Use consistent sampling if specified and not forced to resample
+        if consistent and not force_resample and hasattr(create_dynamic_loader, 'real_indices') and hasattr(create_dynamic_loader, 'syn_indices'):
+            # Reuse previously sampled indices
+            real_indices = create_dynamic_loader.real_indices
+            syn_indices = create_dynamic_loader.syn_indices
+            print(f"Using consistent sampling: same {len(real_indices)} real and {len(syn_indices)} synthetic samples")
+        else:
+            # Randomly select real samples
+            real_indices = torch.randperm(len(real_dataset))[:real_per_epoch].tolist()
+            
+            # For synthetic data sampling
+            if filter_synthetic and confidence_scores is not None:
+                # Prioritize high-confidence synthetic samples
+                # Sort indices by confidence scores (high to low)
+                syn_candidate_indices = torch.argsort(confidence_scores, descending=True).tolist()
+                # Take top-k samples where k is the number we need
+                actual_syn_samples = min(int(syn_per_epoch * progression_ratio), len(synthetic_dataset))
+                syn_indices = syn_candidate_indices[:actual_syn_samples]
+            else:
+                # Random sampling without filtering
+                actual_syn_samples = min(int(syn_per_epoch * progression_ratio), len(synthetic_dataset))
+                syn_indices = torch.randperm(len(synthetic_dataset))[:actual_syn_samples].tolist()
+            
+            # Store indices for consistent sampling
+            if consistent:
+                create_dynamic_loader.real_indices = real_indices
+                create_dynamic_loader.syn_indices = syn_indices
+                if force_resample:
+                    print(f"Forced resampling: new subset of {len(real_indices)} real and {len(syn_indices)} synthetic samples")
+                else:
+                    print(f"Saved indices for consistent sampling in future epochs")
+        
+        # Create subsets
+        real_subset = Subset(real_dataset, real_indices)
+        syn_subset = Subset(synthetic_dataset, syn_indices)
+        
+        # Print the actual ratio
+        actual_syn_samples = len(syn_indices)
+        ratio = actual_syn_samples / (real_per_epoch + actual_syn_samples)
+        print(f"Epoch {epoch}: Using {real_per_epoch} real samples + {actual_syn_samples} synthetic samples ({ratio:.2f} synthetic ratio)")
+        
+        # Wrap both datasets with proper indexing
+        # Note: real_dataset (CIFAR10) returns (data, target)
+        # synthetic_dataset (MemoryMapped) returns (data, target)
+        wrapped_real_subset = IndexWrapper(real_subset, 0)  # Start at index 0
+        wrapped_syn_subset = IndexWrapper(syn_subset, len(real_indices))  # Continue after real indices
+        
+        # Combine datasets
+        combined_dataset = ConcatDataset([wrapped_real_subset, wrapped_syn_subset])
+        
+        # Create dataloader with the custom collate function
+        loader = DataLoader(
+            combined_dataset, 
+            batch_size=batch_size, 
+            shuffle=True,
+            num_workers=num_workers, 
+            pin_memory=True,
+            collate_fn=indexed_collate_fn  # Use custom collate function
+        )
+        
+        return loader, len(combined_dataset)
+
     # Load dataset 
-    def load_data(dataset, batch_size, num_workers):
+    def load_data(dataset, batch_size, num_workers, use_synthetic=False):
         if dataset == 'cifar10':
             train_transform = torchvision.transforms.Compose([
                 torchvision.transforms.RandomCrop(32, padding=4),
@@ -413,6 +691,81 @@ def main():
                 './data', train=True, transform=train_transform, download=True)
             test_dataset = torchvision.datasets.CIFAR10(
                 './data', train=False, transform=test_transform, download=True)
+            
+            if use_synthetic:
+                # Load synthetic data with memory mapping
+                print(f"Loading synthetic data from {args.synthetic_data_path} using memory mapping...")
+                try:
+                    # Create memory-mapped dataset
+                    synthetic_dataset = MemoryMappedSyntheticDataset(args.synthetic_data_path)
+                    
+                    # Load standard dataset for real samples
+                    if args.dataset == 'cifar10':
+                        train_transform = torchvision.transforms.Compose([
+                            torchvision.transforms.RandomCrop(32, padding=4),
+                            torchvision.transforms.RandomHorizontalFlip(),
+                            torchvision.transforms.ToTensor(),
+                        ])
+                        test_transform = torchvision.transforms.Compose([
+                            torchvision.transforms.ToTensor(),
+                        ])
+                        train_dataset = torchvision.datasets.CIFAR10(
+                            './data', train=True, transform=train_transform, download=True)
+                        test_dataset = torchvision.datasets.CIFAR10(
+                            './data', train=False, transform=test_transform, download=True)
+                    else:
+                        raise ValueError(f"Synthetic data only supported for CIFAR-10")
+                    
+                    # Get test loader for evaluation
+                    test_loader = DataLoader(
+                        test_dataset, batch_size=args.test_batch_size, shuffle=False,
+                        num_workers=args.num_workers, pin_memory=True)
+                    
+                    # For the first epoch, use only real data to initialize the model
+                    print("Initializing with real data for first epoch...")
+                    # Wrap the real dataset for consistent indexing
+                    indexed_train_dataset = IndexWrapper(train_dataset, 0) 
+                    train_loader = DataLoader(
+                        indexed_train_dataset, 
+                        batch_size=args.batch_size, 
+                        shuffle=True,
+                        num_workers=args.num_workers, 
+                        pin_memory=True,
+                        collate_fn=indexed_collate_fn # Use custom collate here too
+                    )
+                    n_ex = len(indexed_train_dataset)
+                    
+                    # Configure synthetic data mixing strategy
+                    if args.progressive_mixing:
+                        print("Using progressive mixing strategy for synthetic data")
+                    else:
+                        print(f"Using fixed mixing ratio: {args.real_samples} real + {args.synthetic_samples} synthetic samples")
+                    
+                    # Will be updated in training loop
+                    synthetic_confidence_scores = None
+                    
+                except Exception as e:
+                    print(f"Error loading synthetic data: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print("Falling back to original CIFAR-10 dataset")
+                    use_synthetic = False
+            
+            # If not using synthetic data or if loading failed
+            if not use_synthetic:
+                # Add index to dataset
+                train_dataset = IndexedDataset(train_dataset)
+                n_ex = len(train_dataset)
+                
+                # Use the lower-level DataLoader constructor
+                train_loader = DataLoader(
+                    train_dataset, batch_size=batch_size, shuffle=True,
+                    num_workers=num_workers, pin_memory=True)
+
+            test_loader = DataLoader(
+                test_dataset, batch_size=batch_size, shuffle=False,
+                num_workers=num_workers, pin_memory=True)
+            
         elif dataset == 'cifar100':
             train_transform = torchvision.transforms.Compose([
                 torchvision.transforms.RandomCrop(32, padding=4),
@@ -426,41 +779,91 @@ def main():
                 './data', train=True, transform=train_transform, download=True)
             test_dataset = torchvision.datasets.CIFAR100(
                 './data', train=False, transform=test_transform, download=True)
+            
+            # Add index to dataset
+            train_dataset = IndexedDataset(train_dataset)
+            
+            # Use the lower-level DataLoader constructor to avoid linter issues
+            train_loader = DataLoader(
+                train_dataset, batch_size=batch_size, shuffle=True,
+                num_workers=num_workers, pin_memory=True)
+            test_loader = DataLoader(
+                test_dataset, batch_size=batch_size, shuffle=False,
+                num_workers=num_workers, pin_memory=True)
+            
+            n_ex = len(train_dataset)
         else:
             raise ValueError(f"Unsupported dataset: {dataset}")
         
-        # Add index to dataset
-        train_dataset = IndexedDataset(train_dataset)
-        
-        # Use the lower-level DataLoader constructor to avoid linter issues
-        from torch.utils.data import DataLoader
-        train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True,
-            num_workers=num_workers, pin_memory=True)
-        test_loader = DataLoader(
-            test_dataset, batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, pin_memory=True)
-        
-        return train_loader, test_loader, len(train_dataset)
+        return train_loader, test_loader, n_ex
     
-    # IndexedDataset wrapper to keep track of indices
-    # Use the lower-level Dataset import to avoid linter issues
-    from torch.utils.data import Dataset
-    class IndexedDataset(Dataset):
-        def __init__(self, dataset):
-            self.dataset = dataset
-        
-        def __getitem__(self, index):
-            data, target = self.dataset[index]
-            return data, target, index
-        
-        def __len__(self):
-            return len(self.dataset)
+    # Load dataset with optional synthetic data
+    if args.use_synthetic_data:
+        # Load synthetic data with memory mapping
+        print(f"Loading synthetic data from {args.synthetic_data_path} using memory mapping...")
+        try:
+            # Create memory-mapped dataset
+            synthetic_dataset = MemoryMappedSyntheticDataset(args.synthetic_data_path)
+            
+            # Load standard dataset for real samples
+            if args.dataset == 'cifar10':
+                train_transform = torchvision.transforms.Compose([
+                    torchvision.transforms.RandomCrop(32, padding=4),
+                    torchvision.transforms.RandomHorizontalFlip(),
+                    torchvision.transforms.ToTensor(),
+                ])
+                test_transform = torchvision.transforms.Compose([
+                    torchvision.transforms.ToTensor(),
+                ])
+                train_dataset = torchvision.datasets.CIFAR10(
+                    './data', train=True, transform=train_transform, download=True)
+                test_dataset = torchvision.datasets.CIFAR10(
+                    './data', train=False, transform=test_transform, download=True)
+            else:
+                raise ValueError(f"Synthetic data only supported for CIFAR-10")
+            
+            # Get test loader for evaluation
+            test_loader = DataLoader(
+                test_dataset, batch_size=args.test_batch_size, shuffle=False,
+                num_workers=args.num_workers, pin_memory=True)
+            
+            # For the first epoch, use only real data to initialize the model
+            print("Initializing with real data for first epoch...")
+            # Wrap the real dataset for consistent indexing
+            indexed_train_dataset = IndexWrapper(train_dataset, 0) 
+            train_loader = DataLoader(
+                indexed_train_dataset, 
+                batch_size=args.batch_size, 
+                shuffle=True,
+                num_workers=args.num_workers, 
+                pin_memory=True,
+                collate_fn=indexed_collate_fn # Use custom collate here too
+            )
+            n_ex = len(indexed_train_dataset)
+            
+            # Configure synthetic data mixing strategy
+            if args.progressive_mixing:
+                print("Using progressive mixing strategy for synthetic data")
+            else:
+                print(f"Using fixed mixing ratio: {args.real_samples} real + {args.synthetic_samples} synthetic samples")
+            
+            # Will be updated in training loop
+            synthetic_confidence_scores = None
+            
+        except Exception as e:
+            print(f"Error loading synthetic data: {e}")
+            import traceback
+            traceback.print_exc()
+            print("Falling back to original CIFAR-10 dataset")
+            args.use_synthetic_data = False
+            
+    if not args.use_synthetic_data:
+        train_loader, test_loader, n_ex = load_data(
+            args.dataset, args.batch_size, args.num_workers, False)
     
     # Create perturbations
     if args.dataset != 'imagenet':
         # For ResNet4b, we need to handle the resize properly
-        train_loader, test_loader, n_ex = load_data(args.dataset, args.batch_size, args.num_workers)
         delta = (torch.rand([n_ex] + shapes_dict[args.dataset], dtype=torch.float32, device='cuda:0') * 2 - 1) * args.epsilon
     else:
         raise NotImplementedError("ImageNet dataset is not supported in this script")
@@ -481,6 +884,8 @@ def main():
     with open(log_file, 'w') as f:
         f.write(f"Training started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Arguments: {args}\n\n")
+        if args.use_synthetic_data:
+            f.write(f"Using synthetic data: {args.real_samples} real + {args.synthetic_samples} synthetic samples\n")
         f.write("Note: Adversarial evaluation (PGD-10/PGD-50) is performed every 3 epochs to save time.\n")
         f.write("'-' in adversarial fields indicates no evaluation was performed for that epoch.\n\n")
         f.write("Epoch, Train Loss, Train Nat Acc, Train Adv Acc, Test Nat Loss, Test Nat Acc, Test PGD10 Loss, Test PGD10 Acc, Test PGD50 Loss, Test PGD50 Acc, Time\n")
@@ -493,13 +898,62 @@ def main():
     for epoch in range(1, args.epochs + 1):
         start_time = time.time()
         
-        # Reset perturbations periodically
-        if epoch % epochs_reset == 0 and epoch != args.epochs and epoch > args.warmup_epochs:
-            print(f"Resetting perturbations at epoch {epoch}")
-            if args.dataset != 'imagenet':
-                delta = (torch.rand([n_ex] + shapes_dict[args.dataset], dtype=torch.float32, device='cuda:0') * 2 - 1) * args.epsilon
+        # Determine if we need to reset perturbations and resample
+        should_reset_perturbations = (epoch % epochs_reset == 0 and epoch != args.epochs and epoch > args.warmup_epochs)
+        should_force_resample = should_reset_perturbations and args.sync_resample
+        
+        # For synthetic data training, recreate dataloader each epoch with appropriate mixing
+        if args.use_synthetic_data and epoch > 1:
+            # Determine the progression ratio based on current epoch
+            if args.progressive_mixing:
+                # Linear ramp-up of synthetic data over first half of training
+                max_synthetic_epoch = args.epochs // 2
+                progression_ratio = min(1.0, epoch / max_synthetic_epoch) if epoch <= max_synthetic_epoch else 1.0
             else:
-                delta = (torch.rand([n_ex] + shapes_dict[args.dataset], dtype=torch.float16, device='cuda:0') * 2 - 1) * args.epsilon
+                progression_ratio = 1.0  # Use full synthetic amount
+            
+            # Filter synthetic samples if requested (after initial epochs)
+            if args.filter_synthetic and epoch == args.warmup_epochs:
+                print("Filtering synthetic samples based on model confidence...")
+                synthetic_confidence_scores = synthetic_dataset.filter_samples(model)
+            
+            # Create dataloader with appropriate mixing ratio
+            train_loader, n_ex = create_dynamic_loader(
+                train_dataset, synthetic_dataset, 
+                args.real_samples, args.synthetic_samples,
+                args.batch_size, args.num_workers,
+                consistent=args.consistent_sampling,
+                epoch=epoch,
+                progression_ratio=progression_ratio,
+                filter_synthetic=args.filter_synthetic,
+                confidence_scores=synthetic_confidence_scores,
+                force_resample=should_force_resample
+            )
+            
+            # Resize perturbations if needed
+            if n_ex != len(delta):
+                print(f"Resizing perturbations from {len(delta)} to {n_ex}")
+                old_delta = delta
+                delta = torch.zeros((n_ex, 3, 32, 32), dtype=torch.float32, device="cuda:0")
+                # Copy perturbations for indices that exist in both
+                min_size = min(len(old_delta), n_ex)
+                delta[:min_size] = old_delta[:min_size]
+                # Initialize remaining perturbations randomly
+                if n_ex > len(old_delta):
+                    delta[len(old_delta):] = (torch.rand((n_ex - len(old_delta), 3, 32, 32), 
+                                              dtype=torch.float32, device="cuda:0") * 2 - 1) * args.epsilon
+                
+                # Resize gradient norm history
+                old_gdnorm = gdnorm
+                gdnorm = torch.zeros((n_ex), dtype=torch.float32, device="cuda:0")
+                gdnorm[:min_size] = old_gdnorm[:min_size]
+        
+        # Reset perturbations periodically
+        if should_reset_perturbations:
+            print(f"Resetting perturbations at epoch {epoch}")
+            delta = (torch.rand([n_ex] + shapes_dict[args.dataset], dtype=torch.float32, device='cuda:0') * 2 - 1) * args.epsilon
+            if args.sync_resample and args.use_synthetic_data:
+                print(f"Synchronized perturbation reset with dataset resampling")
         
         # Train for one epoch
         train_loss, train_nat_acc, train_adv_acc = train(

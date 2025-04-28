@@ -7,13 +7,12 @@ from collections import OrderedDict
 
 # Make sure we have the directory for the verification model
 target_dir = "./alpha-beta-CROWN/complete_verifier/models/cifar10_resnet"
-# target_dir = "./ITER_Prune/results/cifar10_iter_lwm_resnet18"
 os.makedirs(target_dir, exist_ok=True)
 
 # Source and destination paths
 # source_model_path = "./Adv-train/results/cifar_atas_resnet18/best.pth"
 # target_model_path = os.path.join(target_dir, "best.pth")
-source_model_path = "./Adv-train/results/cifar_atas_resnet18_pruned/compact_pruned_sparsity_98.0.pth"
+source_model_path = "./Adv-train/results/cifar_atas_resnet18_pruned/final_pruned.pth"
 target_model_path = os.path.join(target_dir, "best.pth")
 
 print(f"Loading source model from {source_model_path}")

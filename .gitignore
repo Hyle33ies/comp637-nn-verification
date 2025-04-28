@@ -2,3 +2,5 @@ data/
 .ipynb_checkpoints/
 __pycache__/
 check_model_compatibility.py
+1m.npz
+param_count.py

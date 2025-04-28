@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Structured Model Pruning Script for ResNet4b with ATAS fine-tuning
-# Usage python structured_prune_resnet4b.py --model-dir ./results/cifar_atas_resnet4b_ultrawide --output-dir ./results/cifar_atas_resnet4b_ultrapruned
+# Structured Model Pruning Script for ResNet18 with ATAS fine-tuning
+# Usage python structured_prune_resnet18.py --model-dir ./results/cifar_atas_resnet18_2 --output-dir ./results/cifar_atas_resnet18_pruned
 import argparse
 import copy
 import json
@@ -17,11 +17,11 @@ import sys
 import psutil
 from collections import OrderedDict
 
-# Custom imports from ATAS
+# Custom imports
 sys.path.append('.')
-from models.resnet4b import CResNet7, BasicBlock, resnet4b, resnet4b_wide, resnet4b_ultrawide
-from ATAS import test_adversarial
-import adv_attack
+from models.resnet import BasicBlock, ResNet18, ResNet18_32, ResNet18_16, ResNet18_8, ResNet18_4
+from ATAS import test_adversarial # Assuming this is still relevant
+import adv_attack # Assuming this is still relevant
 from models.normalize import Normalize
 
 # CIFAR10 statistics
@@ -29,34 +29,43 @@ CIFAR10_MEAN = [0.4914, 0.4822, 0.4465]
 CIFAR10_STD = [0.2470, 0.2435, 0.2616]
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Structured Pruning with Adversarial Fine-tuning')
+    parser = argparse.ArgumentParser(description='Structured Pruning for ResNet18 with Adversarial Fine-tuning')
     
     # Basic parameters
     parser.add_argument('--dataset', default='cifar10', type=str, help='Dataset name')
-    parser.add_argument('--model-dir', default='./results/cifar_atas_resnet4b_wide', type=str, help='Directory of the trained model')
-    parser.add_argument('--output-dir', default='./results/cifar_atas_resnet4b_pruned', type=str, help='Output directory')
+    parser.add_argument('--model-dir', default='./results/cifar_atas_resnet18', type=str, help='Directory of the trained model')
+    parser.add_argument('--output-dir', default='./results/cifar_atas_resnet18_pruned', type=str, help='Output directory')
     parser.add_argument('--seed', default=0, type=int, help='Random seed')
     
     # Training parameters
-    parser.add_argument('--batch-size', default=64, type=int, help='Batch size for training')
+    parser.add_argument('--batch-size', default=128, type=int, help='Batch size for training')
     parser.add_argument('--test-batch-size', default=128, type=int, help='Batch size for testing')
-    parser.add_argument('--finetune-epochs', default=20, type=int, help='Number of epochs for fine-tuning')
-    parser.add_argument('--clean-epochs', default=0, type=int, help='Number of epochs for clean fine-tuning after adversarial training')
-    parser.add_argument('--lr', default=0.02, type=float, help='Learning rate for fine-tuning')
+    parser.add_argument('--finetune-epochs', default=20, type=int, help='Default number of epochs for adversarial fine-tuning per iteration')
+    parser.add_argument('--clean-epochs', default=0, type=int, help='Default number of epochs for clean fine-tuning per iteration')
+    parser.add_argument('--lr', default=0.01, type=float, help='Learning rate for fine-tuning')
     parser.add_argument('--clean-lr', default=0.005, type=float, help='Learning rate for clean fine-tuning')
     parser.add_argument('--weight-decay', default=5e-4, type=float, help='Weight decay')
     parser.add_argument('--momentum', default=0.9, type=float, help='Momentum')
-    parser.add_argument('--num-workers', default=6, type=int, help='Number of data loading workers')
+    parser.add_argument('--num-workers', default=4, type=int, help='Number of data loading workers')
     
     # Pruning parameters
-    parser.add_argument('--prune-rate', default=0.5, type=float, help='Target ratio for pruning (from 32 to 16 planes)')
-    parser.add_argument('--prune-iterations', default=10, type=int, help='Number of pruning iterations')
+    parser.add_argument('--prune-rate', default=0.875, type=float, help='Overall target ratio for pruning (from 64 to 8 planes)')
+    parser.add_argument('--prune-iterations', default=8, type=int, help='Total number of pruning iterations across all stages (ignored if stage-specific iterations are set)')
+    parser.add_argument('--stage1-iterations', default=2, type=int, help='Number of iterations for Stage 1 (64->32)')
+    parser.add_argument('--stage2-iterations', default=2, type=int, help='Number of iterations for Stage 2 (32->16)')
+    parser.add_argument('--stage3-iterations', default=4, type=int, help='Number of iterations for Stage 3 (16->4)')
+    parser.add_argument('--stage1-finetune-epochs', default=3, type=int, help='Adversarial epochs per iteration in Stage 1')
+    parser.add_argument('--stage2-finetune-epochs', default=3, type=int, help='Adversarial epochs per iteration in Stage 2')
+    parser.add_argument('--stage3-finetune-epochs', default=15, type=int, help='Adversarial epochs per iteration in Stage 3 (16->4)')
+    parser.add_argument('--stage1-clean-epochs', default=1, type=int, help='Clean epochs per iteration in Stage 1')
+    parser.add_argument('--stage2-clean-epochs', default=1, type=int, help='Clean epochs per iteration in Stage 2')
+    parser.add_argument('--stage3-clean-epochs', default=0, type=int, help='Clean epochs per iteration in Stage 3 (16->4)')
     
     # Adversarial training parameters
     parser.add_argument('--epsilon', default=4.0/255, type=float, help='Perturbation size for training')
     parser.add_argument('--step-size', default=1.0/255, type=float, help='Step size for PGD')
     parser.add_argument('--pgd-steps', default=10, type=int, help='Number of PGD steps for training')
-    parser.add_argument('--eval-epsilons', default='1.0,2.0,4.0', type=str, help='Comma-separated list of epsilon values for evaluation (in 1/255 units)')
+    parser.add_argument('--eval-epsilons', default='1.0,2.0,4.0,8.0', type=str, help='Comma-separated list of epsilon values for evaluation (in 1/255 units)')
     
     args = parser.parse_args()
     return args
@@ -124,17 +133,10 @@ def load_model(args, device):
     std = CIFAR10_STD
     normalize = Normalize(mean, std)
     
-    # Determine which model type to use based on model_dir name
-    if 'ultrawide' in args.model_dir:
-        print("Loading ultrawide model (in_planes=64)...")
-        base_model = resnet4b_ultrawide()
-    elif 'wide' in args.model_dir:
-        print("Loading wide model (in_planes=32)...")
-        base_model = resnet4b_wide()
-    else:
-        print("Loading standard model (in_planes=16)...")
-        base_model = resnet4b()
-        
+    # Assuming the model directory indicates the original model type (ResNet18 default)
+    print("Loading standard ResNet18 model (in_planes=64)...")
+    base_model = ResNet18()
+    
     model = nn.Sequential(normalize, base_model)
     
     checkpoint_path = os.path.join(args.model_dir, 'best.pth')
@@ -219,10 +221,6 @@ def analyze_layer_importance(model, data_loader, device, criterion=nn.CrossEntro
         if isinstance(module, nn.Conv2d):
             print(f"Analyzing importance of filters in {name}...")
             
-            # Skip if it's the first layer (we want to keep all input channels)
-            if name == 'conv1':
-                continue
-                
             # Get the number of filters in this layer
             num_filters = module.weight.size(0)
             filter_importances = []
@@ -294,49 +292,51 @@ def create_pruned_model(model, prune_indices, device, target_width='auto'):
         model: The model to prune
         prune_indices: Dictionary of layer name to list of filter indices to prune
         device: The device to create the new model on
-        target_width: Target model width ('auto', '16', '32') where 'auto' selects based on source model
+        target_width: Target model width ('auto', '32', '16', '8') where 'auto' selects next stage
     """
     # Get the base model (index 1 in Sequential)
     base_model = model[1] if isinstance(model, nn.Sequential) else model
     
-    # Determine the source model type
+    # Determine the source model type (in_planes)
     if hasattr(base_model, 'in_planes'):
-        source_in_planes = base_model.in_planes
+        # This attribute is tricky in ResNet as it changes during _make_layer
+        # So, infer from conv1 output channels instead
+        source_in_planes = base_model.state_dict()['conv1.weight'].size(0)
     else:
-        # Infer from the first conv layer if attribute isn't available
         source_in_planes = base_model.state_dict()['conv1.weight'].size(0)
     
-    print(f"Source model has in_planes={source_in_planes}")
+    print(f"Source model has initial in_planes={source_in_planes}")
     
     # Determine target model width based on source and target_width parameter
     if target_width == 'auto':
-        # Automatically determine target width based on source
-        if source_in_planes == 64:  # ultrawide -> wide
-            target_in_planes = 32
-            target_model = resnet4b_wide()
-            print("Automatically selected target: resnet4b_wide (in_planes=32)")
-        elif source_in_planes == 32:  # wide -> standard
-            target_in_planes = 16
-            target_model = resnet4b()
-            print("Automatically selected target: resnet4b (in_planes=16)")
-        else:  # already at standard or smaller
-            target_in_planes = 16
-            target_model = resnet4b()
-            print("Automatically selected target: resnet4b (in_planes=16)")
-    elif target_width == '32':
-        target_in_planes = 32
-        target_model = resnet4b_wide()
-        print("Using specified target: resnet4b_wide (in_planes=32)")
-    else:  # default to smallest model (in_planes=16)
-        target_in_planes = 16
-        target_model = resnet4b()
-        print("Using specified target: resnet4b (in_planes=16)")
+        if source_in_planes == 64: target_in_planes = 32
+        elif source_in_planes == 32: target_in_planes = 16
+        elif source_in_planes == 16: target_in_planes = 4 # Changed from 8 to 4
+        else: target_in_planes = 4 # Default to smallest
+    else:
+        target_in_planes = int(target_width)
+        
+    # Select the correct target model function
+    if target_in_planes == 32: target_model_func = ResNet18_32
+    elif target_in_planes == 16: target_model_func = ResNet18_16
+    elif target_in_planes == 8: target_model_func = ResNet18_8 # Keep this for potential use
+    elif target_in_planes == 4: target_model_func = ResNet18_4 # Added ResNet18_4
+    else: 
+        print(f"Warning: Unsupported target_in_planes {target_in_planes}. Defaulting to ResNet18_4.")
+        target_in_planes = 4
+        target_model_func = ResNet18_4
+        
+    target_model = target_model_func()
+    print(f"Targeting model with in_planes={target_in_planes}")
     
     target_model = target_model.to(device)
     
     # Calculate pruning ratio based on source and target width
+    # Ensure source_in_planes is not zero
+    if source_in_planes == 0: 
+        raise ValueError("Source model in_planes cannot be zero.")
     prune_ratio = 1.0 - (float(target_in_planes) / source_in_planes)
-    print(f"Pruning ratio: {prune_ratio:.2f} ({source_in_planes} -> {target_in_planes} in_planes)")
+    print(f"Pruning ratio for this stage: {prune_ratio:.2f} ({source_in_planes} -> {target_in_planes} in_planes)")
     
     # Get the state dictionaries
     source_state_dict = base_model.state_dict()
@@ -348,9 +348,9 @@ def create_pruned_model(model, prune_indices, device, target_width='auto'):
     # We need to track indices of kept filters for each layer to ensure consistency
     kept_indices = {}
     
-    # First, process conv1 (input channels are always RGB (3))
+    # First, process conv1 and bn1 (input channels are always RGB (3))
     conv1_name = 'conv1.weight'
-    if 'conv1' in prune_indices:
+    if 'conv1' in prune_indices: # Usually we don't prune conv1, but handle if specified
         filters_to_prune = prune_indices['conv1']
         all_indices = list(range(source_state_dict[conv1_name].size(0)))
         output_channels_to_keep = [i for i in all_indices if i not in filters_to_prune]
@@ -362,7 +362,6 @@ def create_pruned_model(model, prune_indices, device, target_width='auto'):
     if len(output_channels_to_keep) > target_in_planes:
         output_channels_to_keep = output_channels_to_keep[:target_in_planes]
     elif len(output_channels_to_keep) < target_in_planes:
-        # If we don't have enough, add more from the full list
         all_indices = list(range(source_state_dict[conv1_name].size(0)))
         remaining = [i for i in all_indices if i not in output_channels_to_keep]
         output_channels_to_keep.extend(remaining[:target_in_planes-len(output_channels_to_keep)])
@@ -371,231 +370,235 @@ def create_pruned_model(model, prune_indices, device, target_width='auto'):
     target_state_dict[conv1_name] = source_state_dict[conv1_name][output_channels_to_keep]
     kept_indices['conv1'] = output_channels_to_keep
     
-    # Handle bias if present
-    if 'conv1.bias' in source_state_dict:
+    # Handle bias if present (ResNet18 uses bias=False for conv1)
+    if 'conv1.bias' in source_state_dict and 'conv1.bias' in target_shapes:
         target_state_dict['conv1.bias'] = source_state_dict['conv1.bias'][output_channels_to_keep]
     
-    # BatchNorm1 (if present)
-    if 'bn1.weight' in source_state_dict:
-        target_state_dict['bn1.weight'] = source_state_dict['bn1.weight'][output_channels_to_keep]
-        target_state_dict['bn1.bias'] = source_state_dict['bn1.bias'][output_channels_to_keep]
-        target_state_dict['bn1.running_mean'] = source_state_dict['bn1.running_mean'][output_channels_to_keep]
-        target_state_dict['bn1.running_var'] = source_state_dict['bn1.running_var'][output_channels_to_keep]
+    # BatchNorm1
+    for param_name in ['weight', 'bias', 'running_mean', 'running_var']:
+        bn1_param_name = f'bn1.{param_name}'
+        if bn1_param_name in source_state_dict:
+            target_state_dict[bn1_param_name] = source_state_dict[bn1_param_name][output_channels_to_keep]
     
-    # The input channels for the next layer come from conv1's output channels
+    # The input channels for layer1 come from conv1's output channels
     prev_output_channels = output_channels_to_keep
     
-    # Process BasicBlocks in layer1 and layer2
-    for layer_idx in range(1, 3):  # layer1 and layer2
+    # Process BasicBlocks in layer1, layer2, layer3, layer4
+    # Correct plane calculation for ResNet18 structure
+    layer_planes_map = { 32: [32, 64, 128, 256], 
+                         16: [16, 32, 64, 128],
+                         8:  [8, 16, 32, 64],
+                         4:  [4, 8, 16, 32] }
+    layer_planes = layer_planes_map.get(target_in_planes, layer_planes_map[4]) # Default to 4 if invalid
+
+    for layer_idx in range(1, 5):  # layer1 to layer4
         layer_name = f'layer{layer_idx}'
-        for block_idx in range(2):  # Each layer has 2 blocks
+        target_layer_planes = layer_planes[layer_idx-1]
+        
+        # Each layer in ResNet18 has 2 blocks
+        for block_idx in range(2):  
             block_prefix = f'{layer_name}.{block_idx}'
             
-            # Get expected output channels for this block from target model
-            # In both resnet4b and resnet4b_wide, layer1 and layer2 have in_planes*2 channels
-            target_output_channels = target_in_planes * 2
-            
-            # Process first conv in block
+            # --- Process first conv in block --- 
             conv1_name = f'{block_prefix}.conv1.weight'
+            source_conv1_weight = source_state_dict[conv1_name]
+            target_conv1_shape = target_shapes[conv1_name]
+            target_conv1_output_channels = target_conv1_shape[0]
+            
             if f'{block_prefix}.conv1' in prune_indices:
                 filters_to_prune = prune_indices[f'{block_prefix}.conv1']
-                all_indices = list(range(source_state_dict[conv1_name].size(0)))
+                all_indices = list(range(source_conv1_weight.size(0)))
                 output_channels = [i for i in all_indices if i not in filters_to_prune]
             else:
-                # If not specified, take first channels by default
-                output_channels = list(range(min(target_output_channels, source_state_dict[conv1_name].size(0))))
+                # Default: Keep first channels up to target output size
+                output_channels = list(range(min(target_conv1_output_channels, source_conv1_weight.size(0))))
             
-            # Enforce exact number of channels for target model
-            if len(output_channels) > target_output_channels:
-                output_channels = output_channels[:target_output_channels]
-            elif len(output_channels) < target_output_channels:
-                all_indices = list(range(source_state_dict[conv1_name].size(0)))
+            # Enforce exact number of output channels for target model
+            if len(output_channels) > target_conv1_output_channels:
+                output_channels = output_channels[:target_conv1_output_channels]
+            elif len(output_channels) < target_conv1_output_channels:
+                all_indices = list(range(source_conv1_weight.size(0)))
                 remaining = [i for i in all_indices if i not in output_channels]
-                output_channels.extend(remaining[:target_output_channels-len(output_channels)])
+                output_channels.extend(remaining[:target_conv1_output_channels-len(output_channels)])
             
-            # Get the pruned weight tensor with correct input and output channels
-            source_weight = source_state_dict[conv1_name]
+            # Apply pruning to conv1 weight
+            # Input channels: prev_output_channels
+            # Output channels: output_channels
+            pruned_weight = torch.zeros(target_conv1_shape, device=source_conv1_weight.device, dtype=source_conv1_weight.dtype)
+            out_ch_copy = min(len(output_channels), target_conv1_shape[0])
+            in_ch_copy = min(len(prev_output_channels), target_conv1_shape[1])
             
-            # Check dimensions before slicing to avoid IndexError
-            if len(prev_output_channels) > source_weight.size(1):
-                prev_output_channels = prev_output_channels[:source_weight.size(1)]
-            
-            # Apply pruning to conv1 of this block
-            # Handles case where we need different output and input channel counts
-            pruned_weight = torch.zeros(
-                target_shapes[conv1_name], 
-                device=source_weight.device,
-                dtype=source_weight.dtype
-            )
-            
-            # Copy the selected channels' weights
-            # Only copy what fits in both source and target
-            out_channels = min(len(output_channels), target_shapes[conv1_name][0])
-            in_channels = min(len(prev_output_channels), target_shapes[conv1_name][1])
-            
-            for i in range(out_channels):
-                for j in range(in_channels):
+            for i in range(out_ch_copy):
+                for j in range(in_ch_copy):
                     if i < len(output_channels) and j < len(prev_output_channels):
-                        pruned_weight[i, j] = source_weight[output_channels[i], prev_output_channels[j]]
+                        pruned_weight[i, j] = source_conv1_weight[output_channels[i], prev_output_channels[j]]
             
             target_state_dict[conv1_name] = pruned_weight
             kept_indices[f'{block_prefix}.conv1'] = output_channels
             
-            # Handle bias if present
-            if f'{block_prefix}.conv1.bias' in source_state_dict:
-                bias = source_state_dict[f'{block_prefix}.conv1.bias']
-                pruned_bias = torch.zeros(
-                    target_shapes[f'{block_prefix}.conv1.bias'],
-                    device=bias.device,
-                    dtype=bias.dtype
-                )
-                out_channels = min(len(output_channels), target_shapes[f'{block_prefix}.conv1.bias'][0])
-                for i in range(out_channels):
+            # Handle conv1 bias if present
+            conv1_bias_name = f'{block_prefix}.conv1.bias'
+            if conv1_bias_name in source_state_dict and conv1_bias_name in target_shapes:
+                bias = source_state_dict[conv1_bias_name]
+                pruned_bias = torch.zeros(target_shapes[conv1_bias_name], device=bias.device, dtype=bias.dtype)
+                out_ch_copy = min(len(output_channels), target_shapes[conv1_bias_name][0])
+                for i in range(out_ch_copy):
                     if i < len(output_channels):
                         pruned_bias[i] = bias[output_channels[i]]
-                target_state_dict[f'{block_prefix}.conv1.bias'] = pruned_bias
+                target_state_dict[conv1_bias_name] = pruned_bias
             
-            # BatchNorm after first conv
+            # BatchNorm after first conv (bn1)
             bn1_name = f'{block_prefix}.bn1'
-            if f'{bn1_name}.weight' in source_state_dict:
-                for param_name in ['weight', 'bias', 'running_mean', 'running_var']:
-                    full_name = f'{bn1_name}.{param_name}'
-                    param = source_state_dict[full_name]
-                    pruned_param = torch.zeros(
-                        target_shapes[full_name],
-                        device=param.device,
-                        dtype=param.dtype
-                    )
-                    out_channels = min(len(output_channels), pruned_param.size(0))
-                    for i in range(out_channels):
+            for param_name in ['weight', 'bias', 'running_mean', 'running_var']:
+                bn1_param_name = f'{bn1_name}.{param_name}'
+                if bn1_param_name in source_state_dict:
+                    param = source_state_dict[bn1_param_name]
+                    pruned_param = torch.zeros(target_shapes[bn1_param_name], device=param.device, dtype=param.dtype)
+                    out_ch_copy = min(len(output_channels), pruned_param.size(0))
+                    for i in range(out_ch_copy):
                         if i < len(output_channels):
                             pruned_param[i] = param[output_channels[i]]
-                    target_state_dict[full_name] = pruned_param
+                    target_state_dict[bn1_param_name] = pruned_param
             
-            # Process second conv in block
+            # --- Process second conv in block --- 
             conv2_name = f'{block_prefix}.conv2.weight'
-            # For conv2, output channels should be the same as input
-            # for the residual connection to work
+            source_conv2_weight = source_state_dict[conv2_name]
+            target_conv2_shape = target_shapes[conv2_name]
+            # For conv2, output channels should be the same as input channels (which are output_channels from conv1)
             
-            # Get the pruned weight tensor 
-            source_weight = source_state_dict[conv2_name]
-            pruned_weight = torch.zeros(
-                target_shapes[conv2_name],
-                device=source_weight.device,
-                dtype=source_weight.dtype
-            )
+            # Apply pruning to conv2 weight
+            pruned_weight = torch.zeros(target_conv2_shape, device=source_conv2_weight.device, dtype=source_conv2_weight.dtype)
+            out_ch_copy = min(len(output_channels), target_conv2_shape[0])
+            in_ch_copy = min(len(output_channels), target_conv2_shape[1])
             
-            # Copy the selected channels' weights
-            for i in range(min(target_shapes[conv2_name][0], len(output_channels))):
-                for j in range(min(target_shapes[conv2_name][1], len(output_channels))):
+            for i in range(out_ch_copy):
+                for j in range(in_ch_copy):
                     if i < len(output_channels) and j < len(output_channels):
-                        pruned_weight[i, j] = source_weight[output_channels[i], output_channels[j]]
+                        pruned_weight[i, j] = source_conv2_weight[output_channels[i], output_channels[j]]
             
             target_state_dict[conv2_name] = pruned_weight
             kept_indices[f'{block_prefix}.conv2'] = output_channels
             
-            # Handle bias if present
-            if f'{block_prefix}.conv2.bias' in source_state_dict:
-                bias = source_state_dict[f'{block_prefix}.conv2.bias']
-                pruned_bias = torch.zeros(
-                    target_shapes[f'{block_prefix}.conv2.bias'],
-                    device=bias.device,
-                    dtype=bias.dtype
-                )
-                out_channels = min(len(output_channels), target_shapes[f'{block_prefix}.conv2.bias'][0])
-                for i in range(out_channels):
+            # Handle conv2 bias if present
+            conv2_bias_name = f'{block_prefix}.conv2.bias'
+            if conv2_bias_name in source_state_dict and conv2_bias_name in target_shapes:
+                bias = source_state_dict[conv2_bias_name]
+                pruned_bias = torch.zeros(target_shapes[conv2_bias_name], device=bias.device, dtype=bias.dtype)
+                out_ch_copy = min(len(output_channels), target_shapes[conv2_bias_name][0])
+                for i in range(out_ch_copy):
                     if i < len(output_channels):
                         pruned_bias[i] = bias[output_channels[i]]
-                target_state_dict[f'{block_prefix}.conv2.bias'] = pruned_bias
+                target_state_dict[conv2_bias_name] = pruned_bias
             
-            # BatchNorm after second conv
+            # BatchNorm after second conv (bn2)
             bn2_name = f'{block_prefix}.bn2'
-            if f'{bn2_name}.weight' in source_state_dict:
-                for param_name in ['weight', 'bias', 'running_mean', 'running_var']:
-                    full_name = f'{bn2_name}.{param_name}'
-                    param = source_state_dict[full_name]
-                    pruned_param = torch.zeros(
-                        target_shapes[full_name],
-                        device=param.device,
-                        dtype=param.dtype
-                    )
-                    out_channels = min(len(output_channels), pruned_param.size(0))
-                    for i in range(out_channels):
+            for param_name in ['weight', 'bias', 'running_mean', 'running_var']:
+                bn2_param_name = f'{bn2_name}.{param_name}'
+                if bn2_param_name in source_state_dict and bn2_param_name in target_shapes:
+                    param = source_state_dict[bn2_param_name]
+                    pruned_param = torch.zeros(target_shapes[bn2_param_name], device=param.device, dtype=param.dtype)
+                    out_ch_copy = min(len(output_channels), pruned_param.size(0))
+                    for i in range(out_ch_copy):
                         if i < len(output_channels):
                             pruned_param[i] = param[output_channels[i]]
-                    target_state_dict[full_name] = pruned_param
+                    target_state_dict[bn2_param_name] = pruned_param
             
-            # Handle shortcut if it exists
-            shortcut_name = f'{block_prefix}.shortcut.0.weight'
-            if shortcut_name in source_state_dict and shortcut_name in target_shapes:
-                source_weight = source_state_dict[shortcut_name]
-                pruned_weight = torch.zeros(
-                    target_shapes[shortcut_name],
-                    device=source_weight.device,
-                    dtype=source_weight.dtype
-                )
+            # --- Handle shortcut connection --- 
+            shortcut_conv_name = f'{block_prefix}.shortcut.0.weight'
+            if shortcut_conv_name in source_state_dict and shortcut_conv_name in target_shapes:
+                source_shortcut_weight = source_state_dict[shortcut_conv_name]
+                target_shortcut_shape = target_shapes[shortcut_conv_name]
                 
-                # Copy the selected channels' weights
-                for i in range(min(target_shapes[shortcut_name][0], len(output_channels))):
-                    for j in range(min(target_shapes[shortcut_name][1], len(prev_output_channels))):
+                # Shortcut input comes from prev_output_channels, output goes to output_channels
+                pruned_weight = torch.zeros(target_shortcut_shape, device=source_shortcut_weight.device, dtype=source_shortcut_weight.dtype)
+                out_ch_copy = min(len(output_channels), target_shortcut_shape[0])
+                in_ch_copy = min(len(prev_output_channels), target_shortcut_shape[1])
+                
+                for i in range(out_ch_copy):
+                    for j in range(in_ch_copy):
                         if i < len(output_channels) and j < len(prev_output_channels):
-                            pruned_weight[i, j] = source_weight[output_channels[i], prev_output_channels[j]]
+                            pruned_weight[i, j] = source_shortcut_weight[output_channels[i], prev_output_channels[j]]
                 
-                target_state_dict[shortcut_name] = pruned_weight
+                target_state_dict[shortcut_conv_name] = pruned_weight
                 
-                # Handle bias if present
+                # Handle shortcut bias if present (ResNet18 uses bias=False)
                 shortcut_bias_name = f'{block_prefix}.shortcut.0.bias'
-                if shortcut_bias_name in source_state_dict:
+                if shortcut_bias_name in source_state_dict and shortcut_bias_name in target_shapes:
                     bias = source_state_dict[shortcut_bias_name]
-                    pruned_bias = torch.zeros(
-                        target_shapes[shortcut_bias_name],
-                        device=bias.device,
-                        dtype=bias.dtype
-                    )
-                    out_channels = min(len(output_channels), target_shapes[shortcut_bias_name][0])
-                    for i in range(out_channels):
+                    pruned_bias = torch.zeros(target_shapes[shortcut_bias_name], device=bias.device, dtype=bias.dtype)
+                    out_ch_copy = min(len(output_channels), target_shapes[shortcut_bias_name][0])
+                    for i in range(out_ch_copy):
                         if i < len(output_channels):
                             pruned_bias[i] = bias[output_channels[i]]
                     target_state_dict[shortcut_bias_name] = pruned_bias
                 
-                # BatchNorm in shortcut if present
+                # BatchNorm in shortcut (shortcut.1)
                 bn_shortcut_name = f'{block_prefix}.shortcut.1'
-                if f'{bn_shortcut_name}.weight' in source_state_dict:
-                    for param_name in ['weight', 'bias', 'running_mean', 'running_var']:
-                        full_name = f'{bn_shortcut_name}.{param_name}'
-                        param = source_state_dict[full_name]
-                        pruned_param = torch.zeros(
-                            target_shapes[full_name],
-                            device=param.device,
-                            dtype=param.dtype
-                        )
-                        out_channels = min(len(output_channels), pruned_param.size(0))
-                        for i in range(out_channels):
+                for param_name in ['weight', 'bias', 'running_mean', 'running_var']:
+                    bn_shortcut_param_name = f'{bn_shortcut_name}.{param_name}'
+                    if bn_shortcut_param_name in source_state_dict and bn_shortcut_param_name in target_shapes:
+                        param = source_state_dict[bn_shortcut_param_name]
+                        pruned_param = torch.zeros(target_shapes[bn_shortcut_param_name], device=param.device, dtype=param.dtype)
+                        out_ch_copy = min(len(output_channels), pruned_param.size(0))
+                        for i in range(out_ch_copy):
                             if i < len(output_channels):
                                 pruned_param[i] = param[output_channels[i]]
-                        target_state_dict[full_name] = pruned_param
+                        target_state_dict[bn_shortcut_param_name] = pruned_param
             
-            # Update prev_output_channels for the next block
+            # Update prev_output_channels for the next block/layer
             prev_output_channels = output_channels
     
-    # Handle linear layers
-    if 'linear1.weight' in source_state_dict:
-        # Linear1 needs special handling due to the flattened features
-        # The target shape is fixed for the target model
-        target_weight = target_model.state_dict()['linear1.weight']
-        target_state_dict['linear1.weight'] = target_weight.clone()  # Use the initialized weights
-        target_state_dict['linear1.bias'] = source_state_dict['linear1.bias']  # Bias is the same
-        
-        # Linear2 remains unchanged
-        target_state_dict['linear2.weight'] = source_state_dict['linear2.weight']
-        target_state_dict['linear2.bias'] = source_state_dict['linear2.bias']
+    # Handle final linear layer
+    linear_name = 'linear.weight'
+    source_linear_weight = source_state_dict[linear_name]
+    target_linear_shape = target_shapes[linear_name]
+    
+    # Input features depend on the output channels of the last block (prev_output_channels)
+    # And the expansion factor of the block (which is 1 for BasicBlock)
+    # The target shape already reflects the correct number of input features for the target model
+    # Example: for target_in_planes=4, last layer has 32 output channels. 32 * 1 = 32 features.
+    # Let's double-check the linear layer input size calculation in ResNet definition
+    # ResNet18 linear layer input: self.in_planes (after last layer) * block.expansion
+    # After layer4, self.in_planes = target_in_planes * 8
+    expected_linear_input_features = (target_in_planes * 8) * 1 # Expansion is 1
+    if target_linear_shape[1] != expected_linear_input_features:
+         print(f"Warning: Mismatch in expected linear input features. Target shape: {target_linear_shape[1]}, Expected: {expected_linear_input_features}")
+         # This might indicate an issue in the ResNet definition or the pruning logic
+
+    pruned_linear_weight = torch.zeros(target_linear_shape, device=source_linear_weight.device, dtype=source_linear_weight.dtype)
+    
+    out_features = target_linear_shape[0]
+    # Need to know the actual number of *kept* channels from the last conv layer
+    last_block_channels = prev_output_channels # Output channels from the last block
+    in_features_copy = min(len(last_block_channels), target_linear_shape[1])
+
+    # Copy weights for the kept input features
+    for i in range(out_features):
+        for j in range(in_features_copy):
+            if j < len(last_block_channels):
+                 # Map the kept channel index from the source layer to the target linear layer
+                 # This assumes the feature dimension corresponds directly to the channel index
+                 source_feature_index = last_block_channels[j]
+                 # Check if source_feature_index is within bounds of source linear weight
+                 if source_feature_index < source_linear_weight.shape[1]:
+                      pruned_linear_weight[i, j] = source_linear_weight[i, source_feature_index]
+                 else:
+                      # This case should ideally not happen if indices are tracked correctly
+                      print(f"Warning: Source feature index {source_feature_index} out of bounds for linear layer.")
+
+                
+    target_state_dict[linear_name] = pruned_linear_weight
+    
+    # Handle linear bias
+    linear_bias_name = 'linear.bias'
+    target_state_dict[linear_bias_name] = source_state_dict[linear_bias_name]
     
     # Log what we've done
     print("\nStructured Pruning Summary:")
-    print(f"Original model: in_planes={source_in_planes}")
-    print(f"Pruned model: in_planes={target_in_planes}")
-    for layer_name, indices in kept_indices.items():
-        print(f"Layer {layer_name}: Kept {len(indices)} channels")
+    print(f"Source model initial in_planes={source_in_planes}")
+    print(f"Pruned model target in_planes={target_in_planes}")
+    # for layer_name, indices in kept_indices.items():
+    #     print(f"Layer {layer_name}: Kept {len(indices)} channels") # Optional: Detailed logging
     
     # Apply the pruned state dict to the new model
     try:
@@ -681,7 +684,7 @@ def train_epoch(model, train_loader, optimizer, device, args):
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
         
-        if (batch_idx + 1) % 100 == 0 or (batch_idx + 1) == len(train_loader):
+        if (batch_idx + 1) % 50 == 0 or (batch_idx + 1) == len(train_loader):
             print(f"Batch: {batch_idx+1}/{len(train_loader)}, Loss: {train_loss/(batch_idx+1):.3f}, Acc: {100.*correct/total:.2f}%")
     
     return train_loss / len(train_loader), 100. * correct / total
@@ -737,12 +740,15 @@ def evaluate(model, data_loader, device, epsilon=None, steps=10):
     
     if epsilon is None:
         # Clean evaluation
+        print("  Performing clean evaluation...")
         test_loss = 0
         correct = 0
         total = 0
         
         with torch.no_grad():
-            for inputs, targets in data_loader:
+            for batch_idx, (inputs, targets) in enumerate(data_loader):
+                if batch_idx % 50 == 0:
+                    print(f"    Clean Eval Batch {batch_idx}/{len(data_loader)}")
                 inputs, targets = inputs.to(device), targets.to(device)
                 
                 outputs = model(inputs)
@@ -753,16 +759,21 @@ def evaluate(model, data_loader, device, epsilon=None, steps=10):
                 total += targets.size(0)
                 correct += predicted.eq(targets).sum().item()
         
-        test_loss = test_loss / total
-        test_acc = 100. * correct / total
+        test_loss = test_loss / total if total > 0 else 0
+        test_acc = 100. * correct / total if total > 0 else 0
+        print("  Clean evaluation completed.")
     else:
         # Adversarial evaluation
+        print(f"  Performing adversarial evaluation (PGD-{steps}, eps={epsilon*255:.1f}/255)...")
         test_loss = 0
         correct = 0
         total = 0
         step_size = epsilon / 4  # Smaller step size for evaluation
         
-        for inputs, targets in data_loader:
+        for batch_idx, (inputs, targets) in enumerate(data_loader):
+            if batch_idx % 10 == 0: # Print more frequently for adversarial eval
+                print(f"    Adv Eval Batch {batch_idx}/{len(data_loader)}")
+                
             inputs, targets = inputs.to(device), targets.to(device)
             
             # Initialize with random perturbation
@@ -770,19 +781,21 @@ def evaluate(model, data_loader, device, epsilon=None, steps=10):
             x_adv = torch.clamp(x_adv, 0, 1)
             
             # PGD attack
-            for _ in range(steps):
+            for step in range(steps):
+                # print(f"      PGD Step {step+1}/{steps}") # Uncomment for very detailed debugging
                 x_adv.requires_grad_(True)
                 outputs = model(x_adv)
                 loss = F.cross_entropy(outputs, targets)
                 
-                grad = torch.autograd.grad(loss, x_adv)[0]
-                x_adv = x_adv.detach() + step_size * torch.sign(grad.detach())
+                grad = torch.autograd.grad(loss, x_adv, retain_graph=False, create_graph=False)[0]
+                
+                x_adv = x_adv.detach() + step_size * grad.sign()
                 
                 # Project back into epsilon ball and valid image space
                 delta = torch.clamp(x_adv - inputs, -epsilon, epsilon)
                 x_adv = torch.clamp(inputs + delta, 0, 1)
             
-            # Final evaluation
+            # Final evaluation for this batch
             with torch.no_grad():
                 outputs = model(x_adv)
                 loss = F.cross_entropy(outputs, targets)
@@ -792,8 +805,9 @@ def evaluate(model, data_loader, device, epsilon=None, steps=10):
                 total += targets.size(0)
                 correct += predicted.eq(targets).sum().item()
         
-        test_loss = test_loss / total
-        test_acc = 100. * correct / total
+        test_loss = test_loss / total if total > 0 else 0
+        test_acc = 100. * correct / total if total > 0 else 0
+        print(f"  Adversarial evaluation completed (PGD-{steps}, eps={epsilon*255:.1f}/255).")
     
     return test_loss, test_acc
 
@@ -807,18 +821,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Adjust pruning rate based on model type
-    if 'ultrawide' in args.model_dir:
-        if args.prune_rate < 0.7:
-            original_rate = args.prune_rate
-            args.prune_rate = 0.75
-            print(f"Adjusting pruning rate from {original_rate} to {args.prune_rate} for ultrawide model (64→16 in_planes)")
-    elif 'wide' in args.model_dir:
-        if args.prune_rate < 0.4:
-            original_rate = args.prune_rate
-            args.prune_rate = 0.5
-            print(f"Adjusting pruning rate from {original_rate} to {args.prune_rate} for wide model (32→16 in_planes)")
-    
     # Set up logging
     log_path, log_data = setup_logging(args)
     
@@ -826,28 +828,17 @@ def main():
     train_loader, test_loader, train_size, test_size = get_dataset(args)
     print(f"Train set: {train_size} samples, Test set: {test_size} samples")
     
-    # Load the pretrained model
+    # Load the pretrained model (should be ResNet18 with in_planes=64)
     model = load_model(args, device)
+    source_width = 64
     
-    # Determine source model width from model name
-    if 'ultrawide' in args.model_dir:
-        source_width = 64
-        print("Source model is ultrawide (in_planes=64)")
-        # We'll use staged pruning: ultrawide->wide->standard
-        stages = ['32', '16']
-        stage_names = ['wide', 'standard']
-    elif 'wide' in args.model_dir:
-        source_width = 32
-        print("Source model is wide (in_planes=32)")
-        # Only need one stage: wide->standard
-        stages = ['16']
-        stage_names = ['standard']
-    else:
-        source_width = 16
-        print("Source model is standard (in_planes=16)")
-        # No pruning needed, but we'll still run iterations for fine-tuning
-        stages = ['16']
-        stage_names = ['standard']
+    # Define the pruning stages and their corresponding arguments
+    stages = ['32', '16', '4']
+    stage_names = ['32', '16', '4']
+    stage_iterations_args = [args.stage1_iterations, args.stage2_iterations, args.stage3_iterations]
+    stage_finetune_epochs_args = [args.stage1_finetune_epochs, args.stage2_finetune_epochs, args.stage3_finetune_epochs]
+    stage_clean_epochs_args = [args.stage1_clean_epochs, args.stage2_clean_epochs, args.stage3_clean_epochs]
+
     
     # Evaluate the original model
     print("\n=== Evaluating original model ===")
@@ -876,50 +867,51 @@ def main():
     log_data['original_model'] = {
         'natural_acc': orig_natural_acc,
         'adversarial_accs': orig_adv_accs,
+        'source_width': source_width
     }
     
     # Initialize pruning
     current_model = model
+    current_width = source_width
     
     # Process each stage sequentially
-    for stage_idx, (target_width, stage_name) in enumerate(zip(stages, stage_names)):
-        print(f"\n\n=== Starting STAGE {stage_idx+1}/{len(stages)}: Pruning to {stage_name} (in_planes={target_width}) ===\n")
+    for stage_idx, (target_width_str, stage_name) in enumerate(zip(stages, stage_names)):
+        target_width = int(target_width_str)
+        print(f"\n\n=== Starting STAGE {stage_idx+1}/{len(stages)}: Pruning {current_width} -> {target_width} (target in_planes={target_width}) ===\n")
         
-        # Calculate how many iterations for this stage
-        if len(stages) == 1:
-            # If only one stage, use all iterations
-            stage_iterations = args.prune_iterations
-        else:
-            # Distribute iterations proportionally to the pruning ratio
-            if stage_idx == 0:  # First stage (64->32)
-                stage_iterations = args.prune_iterations // 2
-            else:  # Second stage (32->16)
-                stage_iterations = args.prune_iterations - (args.prune_iterations // 2)
+        # Assign iterations and epochs for this stage from args
+        stage_iterations = stage_iterations_args[stage_idx]
+        stage_finetune_epochs = stage_finetune_epochs_args[stage_idx]
+        stage_clean_epochs = stage_clean_epochs_args[stage_idx]
         
-        print(f"Running {stage_iterations} pruning iterations for this stage")
+        if stage_iterations == 0: 
+            print("Skipping stage - 0 iterations specified.")
+            continue # Skip if no iterations assigned
         
-        # Reset the current model's prune ratio for this stage
-        if target_width == '32':
-            stage_prune_ratio = 1.0 - (32.0 / source_width)
-        else:  # target_width == '16'
-            if source_width == 64 and stage_idx == 1:  # Second stage from wide(32) to standard(16)
-                stage_prune_ratio = 0.5  # 32 to 16 is 50% pruning
-            else:
-                stage_prune_ratio = 1.0 - (16.0 / source_width)
-                
-        print(f"Stage pruning ratio: {stage_prune_ratio:.2f}")
+        print(f"Running {stage_iterations} pruning iterations for this stage.")
+        print(f"  Adversarial finetune epochs per iteration: {stage_finetune_epochs}")
+        print(f"  Clean finetune epochs per iteration: {stage_clean_epochs}")
         
-        # Calculate per-iteration pruning rate
-        iteration_prune_rate = stage_prune_ratio / stage_iterations
+        # Calculate pruning ratio for this specific stage
+        stage_prune_ratio = 1.0 - (float(target_width) / current_width)
+        print(f"Stage pruning ratio: {stage_prune_ratio:.2f} ({current_width} -> {target_width})")
         
         # Iterate through pruning steps for this stage
         for iteration in range(1, stage_iterations + 1):
             print(f"\n=== Stage {stage_idx+1} Pruning Iteration {iteration}/{stage_iterations} ===")
             
+            # Calculate the effective prune rate for *this* iteration
+            # Aim for equal reduction steps towards the stage target
+            current_prune_fraction = (stage_prune_ratio / stage_iterations)
+            iteration_prune_rate = current_prune_fraction / (1 - (iteration - 1) * current_prune_fraction)
+            iteration_prune_rate = max(0, min(iteration_prune_rate, 1.0)) # Clamp between 0 and 1
+            
+            print(f"Iteration prune rate: {iteration_prune_rate:.3f}")
+
             # Analyze importance for current model
             importances = analyze_layer_importance(current_model, train_loader, device)
             
-            # Select channels to prune
+            # Select channels to prune for this iteration
             prune_indices = select_channels_to_prune(importances, iteration_prune_rate)
             
             # Create a new pruned model with the target width for this stage
@@ -927,7 +919,7 @@ def main():
                 current_model, 
                 prune_indices, 
                 device, 
-                target_width=target_width
+                target_width=target_width_str # Pass the target width string
             )
             
             # Evaluate the pruned model before fine-tuning
@@ -936,7 +928,7 @@ def main():
             print(f"Pruned model - Natural Accuracy: {pruned_nat_acc:.2f}% (before fine-tuning)")
             
             # Fine-tune the pruned model
-            print(f"\n=== Fine-tuning for {args.finetune_epochs} epochs ===")
+            print(f"\n=== Adversarial Fine-tuning for {stage_finetune_epochs} epochs ===")
             
             optimizer = optim.SGD(
                 pruned_model.parameters(),
@@ -944,13 +936,14 @@ def main():
                 momentum=args.momentum,
                 weight_decay=args.weight_decay
             )
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.finetune_epochs)
+            # Use stage-specific epochs for scheduler
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=stage_finetune_epochs)
             
             best_adv_acc_4 = 0  # Track best adversarial accuracy at 4/255
             best_model_state = None
             
-            for epoch in range(1, args.finetune_epochs + 1):
-                print(f"\nEpoch {epoch}/{args.finetune_epochs}")
+            for epoch in range(1, stage_finetune_epochs + 1):
+                print(f"\nAdv Epoch {epoch}/{stage_finetune_epochs}")
                 
                 # Train for one epoch with adversarial examples
                 train_loss, train_acc = train_epoch(pruned_model, train_loader, optimizer, device, args)
@@ -966,7 +959,7 @@ def main():
                 eval_eps_4 = 4.0/255  # Use 4/255 directly
                 _, val_adv_acc_4 = evaluate(pruned_model, test_loader, device, epsilon=eval_eps_4, steps=10)
                 
-                print(f"Epoch {epoch} - Natural: {val_nat_acc:.2f}%, PGD-10 @ 1/255: {val_adv_acc_1:.2f}%, PGD-10 @ 4/255: {val_adv_acc_4:.2f}%")
+                print(f"Adv Epoch {epoch} - Natural: {val_nat_acc:.2f}%, PGD-10 @ 1/255: {val_adv_acc_1:.2f}%, PGD-10 @ 4/255: {val_adv_acc_4:.2f}%")
                 
                 # Update learning rate
                 scheduler.step()
@@ -975,15 +968,15 @@ def main():
                 if val_adv_acc_4 > best_adv_acc_4:
                     best_adv_acc_4 = val_adv_acc_4
                     best_model_state = copy.deepcopy(pruned_model.state_dict())
-                    print(f"New best model with adversarial accuracy {best_adv_acc_4:.2f}% at epsilon=4/255")
+                    print(f"New best adv model with adversarial accuracy {best_adv_acc_4:.2f}% at epsilon=4/255")
             
-            # Restore best model
+            # Restore best model from adversarial finetuning
             if best_model_state is not None:
                 pruned_model.load_state_dict(best_model_state)
                 
             # Additional clean fine-tuning to recover natural accuracy
-            if args.clean_epochs > 0:
-                print(f"\n=== Clean fine-tuning for {args.clean_epochs} epochs to recover natural accuracy ===")
+            if stage_clean_epochs > 0:
+                print(f"\n=== Clean Fine-tuning for {stage_clean_epochs} epochs ===")
                 
                 clean_optimizer = optim.SGD(
                     pruned_model.parameters(),
@@ -991,13 +984,15 @@ def main():
                     momentum=args.momentum,
                     weight_decay=args.weight_decay
                 )
-                clean_scheduler = optim.lr_scheduler.CosineAnnealingLR(clean_optimizer, T_max=args.clean_epochs)
+                # Use stage-specific epochs for scheduler
+                clean_scheduler = optim.lr_scheduler.CosineAnnealingLR(clean_optimizer, T_max=stage_clean_epochs)
                 
                 best_nat_acc = 0
-                best_nat_model_state = None
-                
-                for epoch in range(1, args.clean_epochs + 1):
-                    print(f"\nClean Epoch {epoch}/{args.clean_epochs}")
+                best_nat_model_state = None # Track best state during clean tuning
+                current_best_adv_acc_4 = best_adv_acc_4 # Adv accuracy from previous phase
+
+                for epoch in range(1, stage_clean_epochs + 1):
+                    print(f"\nClean Epoch {epoch}/{stage_clean_epochs}")
                     
                     # Train for one epoch with clean examples
                     train_loss, train_acc = train_clean_epoch(pruned_model, train_loader, clean_optimizer, device)
@@ -1009,7 +1004,7 @@ def main():
                     eval_eps_1 = eval_epsilons[0]  
                     _, val_adv_acc_1 = evaluate(pruned_model, test_loader, device, epsilon=eval_eps_1, steps=10)
                     
-                    # Evaluate on epsilon=4/255 (for model selection)
+                    # Evaluate on epsilon=4/255 (for model selection constraint)
                     eval_eps_4 = 4.0/255
                     _, val_adv_acc_4 = evaluate(pruned_model, test_loader, device, epsilon=eval_eps_4, steps=10)
                     
@@ -1018,21 +1013,21 @@ def main():
                     # Update learning rate
                     clean_scheduler.step()
                     
-                    # Save best model based on natural accuracy, with a constraint on adversarial accuracy
-                    # Only save if natural accuracy improves and adversarial accuracy at 4/255 doesn't drop too much
-                    if val_nat_acc > best_nat_acc and val_adv_acc_4 >= best_adv_acc_4 * 0.95:  # Allow 5% drop in adversarial accuracy
+                    # Save best model based on natural accuracy, with constraint on adversarial accuracy at 4/255
+                    # Only save if natural accuracy improves AND adv accuracy doesn't drop too much from best adv epoch
+                    if val_nat_acc > best_nat_acc and val_adv_acc_4 >= current_best_adv_acc_4 * 0.95: 
                         best_nat_acc = val_nat_acc
                         best_nat_model_state = copy.deepcopy(pruned_model.state_dict())
-                        print(f"New best clean model with natural accuracy {best_nat_acc:.2f}% and adversarial accuracy {val_adv_acc_4:.2f}% at epsilon=4/255")
+                        print(f"New best clean model state saved: Nat Acc {best_nat_acc:.2f}%, Adv Acc@4/255 {val_adv_acc_4:.2f}%")
                 
-                # Restore best clean model if it improves natural accuracy without compromising robustness
+                # Restore best clean model state if found
                 if best_nat_model_state is not None:
                     pruned_model.load_state_dict(best_nat_model_state)
-                    print(f"Restored best clean model with natural accuracy {best_nat_acc:.2f}%")
+                    print(f"Restored best clean model state with Nat Acc {best_nat_acc:.2f}%")
             
             # If this is the last iteration of the stage, evaluate on all epsilons
             if iteration == stage_iterations:
-                print(f"\n=== Evaluating stage {stage_idx+1} model ===")
+                print(f"\n=== Evaluating stage {stage_idx+1} model (target in_planes={target_width}) ===")
                 final_nat_loss, final_nat_acc = evaluate(pruned_model, test_loader, device)
                 final_adv_accs = {}
                 
@@ -1088,6 +1083,9 @@ def main():
             
             # Update current model for next iteration
             current_model = pruned_model
+            # Update current width for the next stage calculation if this is the last iteration
+            if iteration == stage_iterations:
+                 current_width = target_width
     
     # Save the final pruned model
     final_model = current_model[1] if isinstance(current_model, nn.Sequential) else current_model
